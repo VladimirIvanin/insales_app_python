@@ -76,14 +76,32 @@ def create_routes(store: Store, lifecycle: Lifecycle,
 
     @blueprint.route('/login')
     def login():
-        """Начало login flow: создаёт challenge и redirect в InSales."""
+        """Начало login flow: проверяет неподтверждённую установку,
+        затем создаёт challenge и redirect в InSales."""
         try:
             shop = request.args.get('shop', '').lower().strip()
             insales_id = request.args.get('insales_id', '')
 
             store_row = store.get_store(insales_id)
-            if store_row is None or store_row['shop'] != shop:
+            if store_row is not None and store_row['shop'] != shop:
                 return 'Store not installed', 404
+
+            # Шаг 1: проверяем более нового кандидата (даже если магазин активен)
+            # Если есть более новый кандидат с другими credentials — пробуем
+            # активировать. Успех API заменяет подключение, неудача не трогает
+            # старое.
+            try:
+                activated = lifecycle.verify_pending_install(insales_id, shop)
+                if activated is None and store_row is None:
+                    return 'Store not installed', 404
+                if activated is not None:
+                    # Активирован новый кандидат (или первый, или при живом
+                    # магазине)
+                    store_row = store.get_store(insales_id)
+                    if store_row is None:
+                        return 'Store not installed', 404
+            except LifecycleError as e:
+                return str(e), 502
 
             challenge_sid, nonce, _ = lifecycle.create_challenge(insales_id)
             query = urlencode({
@@ -114,7 +132,6 @@ def create_routes(store: Store, lifecycle: Lifecycle,
         challenge_sid = request.cookies.get('challenge_sid', '')
         session_id = lifecycle.verify_autologin(
             challenge_sid=challenge_sid,
-            cookie_sid=challenge_sid,
             params=request.args,
         )
         if session_id is None:

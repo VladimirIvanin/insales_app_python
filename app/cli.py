@@ -1,26 +1,19 @@
 """Интерфейс командной строки для управления приложением.
 
 Использование:
-    python -m app.cli serve          # Запустить сервер
-    python -m app.cli db upgrade     # Применить миграции
-    python -m app.cli db status      # Статус миграций
-    python -m app.cli doctor         # Диагностика системы
-    python -m app.cli webhook list   # Список последних вебхуков
-    python -m app.cli webhook get <id>   # Детали вебхука
-    python -m app.cli webhook retry <id> # Повтор сбойного вебхука
+    insales-app serve          # Запустить сервер
+    insales-app db upgrade     # Применить миграции
+    insales-app db status      # Статус миграций
+    insales-app doctor         # Диагностика системы
 """
 from __future__ import annotations
 
 import os
 import sys
-from typing import TYPE_CHECKING
 
 from app.config import Settings
 from app.db.connection import status as db_status
 from app.db.connection import upgrade as db_upgrade
-
-if TYPE_CHECKING:
-    from app.repositories.webhook_inbox import WebhookInbox
 
 
 def cmd_serve(settings: Settings) -> None:
@@ -115,33 +108,39 @@ def cmd_doctor(settings: Settings) -> int:
         from insales.store import Store
 
         store = Store(settings.db_path)
-        stores = store.list_stores()
-        if not stores:
-            print('  – Нет установленных магазинов')
+        if not settings.db_path.exists():
+            print('  – База данных отсутствует — проверка API недоступна')
         else:
-            for s in stores:
-                shop = s.get('shop', '?')
-                store_id = s.get('id', '?')
-                try:
-                    # Получаем полные credentials магазина (с паролем)
-                    full = store.get_store(store_id)
-                    password = full['password'] if full else ''
-                    if not password:
-                        print(f'  ✗ Магазин #{store_id}: {shop} — нет credentials')
+            try:
+                stores = store.list_stores()
+            except Exception as exc:
+                print(f'  – Невозможно прочитать список магазинов: {exc}')
+                stores = []
+            if not stores:
+                print('  – Нет установленных магазинов')
+            else:
+                for s in stores:
+                    shop = s.get('shop', '?')
+                    store_id = s.get('id', '?')
+                    try:
+                        full = store.get_store(store_id)
+                        password = full['password'] if full else ''
+                        if not password:
+                            print(f'  ✗ Магазин #{store_id}: {shop} — нет credentials')
+                            issues += 1
+                            continue
+                        client = InSalesClient(
+                            shop=shop,
+                            app_id=settings.app_id,
+                            password=password,
+                            dev=settings.dev,
+                        )
+                        account = client.get_account()[0]
+                        title = account.get('title', shop)
+                        print(f'  ✓ Магазин #{store_id}: {title} ({shop})')
+                    except Exception as exc:
+                        print(f'  ✗ Магазин #{store_id}: {shop} — {exc}')
                         issues += 1
-                        continue
-                    client = InSalesClient(
-                        shop=shop,
-                        app_id=settings.app_id,
-                        password=password,
-                        dev=settings.dev,
-                    )
-                    account = client.get_account()[0]
-                    title = account.get('title', shop)
-                    print(f'  ✓ Магазин #{store_id}: {title} ({shop})')
-                except Exception as exc:
-                    print(f'  ✗ Магазин #{store_id}: {shop} — {exc}')
-                    issues += 1
     except Exception as exc:
         print(f'  ✗ Ошибка проверки магазинов: {exc}')
         issues += 1
@@ -160,134 +159,6 @@ def _fmt_size(size: int) -> str:
             return f'{size:.1f} {unit}'
         size /= 1024
     return f'{size:.1f} GB'
-
-
-def cmd_webhook(settings: Settings, sub: str, args: list[str]) -> int:
-    """Управление webhook-событиями.
-
-    Подкоманды:
-        list [N]     — показать последние N событий (по умолч. 20)
-        get <id>     — детали события
-        retry <id>   — сбросить сбойное событие в pending для повтора
-    """
-    if not sub:
-        print('Usage: python -m app.cli webhook (list|get|retry)')
-        return 1
-
-    from app.repositories.webhook_inbox import WebhookInbox
-    from insales.store import Store
-
-    store = Store(settings.db_path)
-    inbox = WebhookInbox(store)
-
-    if sub == 'list':
-        limit = int(args[0]) if args else 20
-        return _cmd_webhook_list(inbox, limit)
-
-    if sub == 'get':
-        if not args:
-            print('Usage: python -m app.cli webhook get <id>')
-            return 1
-        return _cmd_webhook_get(inbox, args[0])
-
-    if sub == 'retry':
-        if not args:
-            print('Usage: python -m app.cli webhook retry <id>')
-            return 1
-        return _cmd_webhook_retry(inbox, args[0])
-
-    print(f'Unknown webhook subcommand: {sub}')
-    return 1
-
-
-def _cmd_webhook_list(inbox: WebhookInbox, limit: int) -> int:
-    """Показать последние N событий."""
-
-    # Прямой SQL, т.к. inbox.list_pending() показывает только pending
-    with inbox._store._connect() as conn:  # noqa: SLF001
-        rows = conn.execute(
-            '''SELECT id, store_id, topic, state, attempts,
-                      error, created_at
-               FROM webhook_inbox
-               ORDER BY id DESC
-               LIMIT ?''',
-            (limit,),
-        ).fetchall()
-
-    if not rows:
-        print('Событий не найдено')
-        return 0
-
-    print(f'Последние {len(rows)} событий:')
-    print()
-    header = f'{"ID":<6} {"Store":<8} {"Topic":<25} {"State":<12} {"Attempts":<9} Error'
-    print(header)
-    print('-' * len(header))
-    for r in rows:
-        error = (r['error'] or '')[:40]
-        print(f'{r["id"]:<6} {r["store_id"]:<8} {r["topic"]:<25} '
-              f'{r["state"]:<12} {r["attempts"]:<9} {error}')
-    return 0
-
-
-def _cmd_webhook_get(inbox: WebhookInbox, event_id: str) -> int:
-    """Показать детали события."""
-    try:
-        event = inbox.get(int(event_id))
-    except (ValueError, TypeError):
-        print(f'Ошибка: ID должен быть числом, получено: {event_id}')
-        return 1
-
-    if event is None:
-        print(f'Событие #{event_id} не найдено')
-        return 1
-
-    print(f'Событие #{event["id"]}')
-    print(f'  Store ID:     {event["store_id"]}')
-    print(f'  Generation:   {event["generation"]}')
-    print(f'  Topic:        {event["topic"]}')
-    print(f'  State:        {event["state"]}')
-    print(f'  Attempts:     {event["attempts"]} / {event["max_attempts"]}')
-    print(f'  Created:      {event["created_at"]}')
-    print(f'  Next attempt: {event["next_attempt_at"]}')
-    print(f'  Error:        {event["error"] or "—"}')
-    print(f'  Payload:      {(event.get("payload") or "—")[:500]}')
-    return 0
-
-
-def _cmd_webhook_retry(inbox: WebhookInbox, event_id: str) -> int:
-    """Сбросить сбойное событие в pending для повторной обработки."""
-    try:
-        event_id_int = int(event_id)
-    except (ValueError, TypeError):
-        print(f'Ошибка: ID должен быть числом, получено: {event_id}')
-        return 1
-
-    event = inbox.get(event_id_int)
-    if event is None:
-        print(f'Событие #{event_id} не найдено')
-        return 1
-
-    if event['state'] != 'failed':
-        print(f'Событие #{event_id} в состоянии "{event["state"]}", '
-              f'ожидалось "failed"')
-        return 1
-
-    # Сбрасываем: state=pending, attempts=0, error=NULL, next_attempt_at=now
-    import time
-
-    with inbox._store._connect() as conn:  # noqa: SLF001
-        conn.execute(
-            '''UPDATE webhook_inbox
-               SET state='pending', attempts=0, error=NULL,
-                   next_attempt_at=?, locked_at=NULL, locked_by=NULL,
-                   updated_at=julianday("now")
-               WHERE id=? AND state='failed' ''',
-            (time.time(), event_id_int),
-        )
-
-    print(f'Событие #{event_id} сброшено в pending и будет повторно обработано')
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -313,10 +184,6 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == 'doctor':
         return cmd_doctor(settings)
 
-    if cmd == 'webhook':
-        sub = argv[1] if len(argv) > 1 else ''
-        return cmd_webhook(settings, sub, argv[2:])
-
     if cmd == 'db':
         sub = argv[1] if len(argv) > 1 else ''
         if sub == 'upgrade':
@@ -324,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
         elif sub == 'status':
             cmd_db_status(settings)
         else:
-            print('Usage: python -m app.cli db (upgrade|status)')
+            print('Usage: insales-app db (upgrade|status)')
             return 1
         return 0
 

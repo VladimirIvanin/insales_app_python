@@ -99,7 +99,7 @@ class Transport:
 
         Args:
             method: HTTP-метод (GET, POST, PUT, DELETE).
-            path: Путь endpoint (например, /admin/webhooks.json).
+            path: Путь endpoint (например, /admin/account.json).
             body: Тело запроса в байтах (для POST/PUT).
             content_type: Content-Type тела (по умолчанию application/json).
 

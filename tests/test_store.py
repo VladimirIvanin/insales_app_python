@@ -18,7 +18,7 @@ def tmp_db():
 
 
 def test_fresh_db_gets_schema(tmp_db):
-    """Новая БД получает схему версии 2."""
+    """Новая БД получает схему текущей версии."""
     upgrade(tmp_db)
     store = Store(tmp_db)
     store.add_store('1', 'shop.example', 'pwd', title='Shop')
@@ -102,7 +102,7 @@ def test_upgrade_status(tmp_db):
     st2 = status(tmp_db)
     for entry in st2:
         if entry['version'] == 'current':
-            assert entry['applied'] == 4
+            assert entry['applied'] == 5
 
 
 def test_generation_monotonic_after_upgrade(tmp_db):

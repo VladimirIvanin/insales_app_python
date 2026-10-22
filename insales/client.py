@@ -2,11 +2,7 @@
 
 Фасад над Transport + Resource. Собирает ресурсы в атрибуты:
     client.account.get()
-    client.webhooks.list()
     client.orders.get(order_id)
-
-Совместимость: старые методы (get, post, put, delete, get_account, verify_identity)
-оставлены для плавного перехода.
 """
 from __future__ import annotations
 
@@ -17,7 +13,6 @@ from insales.errors import ApiError  # noqa: F401
 from insales.resources.account import Account
 from insales.resources.orders import Orders
 from insales.resources.products import Products
-from insales.resources.webhooks import Webhooks
 from insales.transport import (  # noqa: F401
     MAX_RESPONSE_BYTES,  # noqa: F401
     Transport,
@@ -32,7 +27,6 @@ class InSalesClient:
         client = InSalesClient(shop='shop.example',
                                 app_id='app', password='pwd')
         account = client.account.get()
-        hooks = client.webhooks.list()
     """
 
     def __init__(self, shop: str, app_id: str, password: str,
@@ -42,11 +36,8 @@ class InSalesClient:
 
         # Ресурсы
         self.account = Account(self._transport)
-        self.webhooks = Webhooks(self._transport)
         self.orders = Orders(self._transport)
         self.products = Products(self._transport)
-
-        # Совместимость: fill-in для ещё не созданных ресурсов
 
     # ---- Совместимость со старым API ----
 

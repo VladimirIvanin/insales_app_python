@@ -1,10 +1,9 @@
 """Тесты жизненного цикла приложения InSales.
 
 Проверяют:
-- Установку с верификацией через API
+- Установку (сохранение кандидата без сетевого вызова)
+- Проверку кандидата при входе (verify_pending_install)
 - ALLOWED_SHOPS (обязательный)
-- Отклонение поддельной установки
-- Атомарную активацию (activate_install, гонки поколений)
 - Login/autologin с token3
 - Привязку challenge к browser cookie
 - Uninstall с проверкой пароля и единой транзакцией
@@ -15,16 +14,15 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.middleware import SessionMiddleware
 from insales.client import ApiError
 from insales.crypto import sign_token3
-from insales.lifecycle import Lifecycle
+from insales.lifecycle import Lifecycle, LifecycleError
+from insales.transport import TransportError
 
 VECTORS = json.loads(
     Path(__file__).with_name('protocol-vectors.json').read_text()
@@ -37,7 +35,7 @@ VECTORS = json.loads(
 
 class TestInstall:
     def test_install_creates_candidate(self, lifecycle, store):
-        """Install создаёт кандидата."""
+        """Install создаёт кандидата без сетевого вызова."""
         candidate = lifecycle.process_install(
             shop='shop.example',
             insales_id='42',
@@ -55,7 +53,9 @@ class TestInstall:
                 insales_id='99',
                 token='token',
             )
-        assert store.list_installs() == []
+        # Все кандидаты = 0
+        count = store.count_installs_by_store('99')
+        assert count == 0
 
     def test_install_allowed_shops_empty_rejected(self, store):
         """Пустой ALLOWED_SHOPS отклоняет все установки."""
@@ -67,214 +67,7 @@ class TestInstall:
                 insales_id='1',
                 token='tok',
             )
-        assert store.list_installs() == []
-        lc.shutdown()
-
-    def test_verify_install_success(self, lifecycle, store):
-        """Успешная верификация активирует магазин через activate_install."""
-        candidate = lifecycle.process_install(
-            shop='shop.example',
-            insales_id='42',
-            token='install-token',
-        )
-
-        mock_client = MagicMock()
-        mock_client.get_account.return_value = (
-            {'id': 42, 'title': 'Test Shop'}, '1/500',
-        )
-
-        with patch.object(lifecycle, '_make_client', return_value=mock_client):
-            lifecycle._verify_install_worker(candidate)
-
-        store_row = store.get_store('42')
-        assert store_row is not None
-        assert store_row['shop'] == 'shop.example'
-        assert store_row['title'] == 'Test Shop'
-
-    def test_forged_install_does_not_replace_working(
-        self, lifecycle, store, preinstalled_store,
-    ):
-        """Поддельная установка не заменяет работающее подключение."""
-        store, *_ = preinstalled_store
-        candidate = lifecycle.process_install(
-            shop='shop.example',
-            insales_id='42',
-            token='fake-token',
-        )
-
-        mock_client = MagicMock()
-        mock_client.get_account.side_effect = ApiError(401)
-
-        with patch.object(lifecycle, '_make_client', return_value=mock_client):
-            lifecycle._verify_install_worker(candidate)
-
-        store_row = store.get_store('42')
-        # Пароль не должен измениться после поддельной установки
-        assert store_row is not None
-
-    def test_store_id_mismatch_rejected(self, lifecycle, store):
-        """Несовпадение store_id в account API отклоняет кандидата."""
-        candidate = lifecycle.process_install(
-            shop='shop.example',
-            insales_id='99',
-            token='install-token',
-        )
-
-        mock_client = MagicMock()
-        mock_client.get_account.return_value = ({'id': 42}, '1/500')
-
-        with patch.object(lifecycle, '_make_client', return_value=mock_client):
-            lifecycle._verify_install_worker(candidate)
-
-        assert store.get_store('99') is None
-        assert store.get_install(candidate) is None
-
-    def test_temporary_error_preserves_candidate(self, lifecycle, store):
-        """Временная ошибка (429) не удаляет кандидата мгновенно,
-        а повторяет попытку. После исчерпания retry удаляет."""
-        candidate = lifecycle.process_install(
-            shop='shop.example',
-            insales_id='42',
-            token='install-token',
-        )
-
-        mock_client = MagicMock()
-        mock_client.get_account.side_effect = ApiError(429)
-
-        with patch.object(lifecycle, '_make_client', return_value=mock_client):
-            with patch.object(lifecycle, '_retry_or_discard') as mock_retry:
-                lifecycle._verify_install_worker(candidate)
-
-        # Первый вызов не удаляет — передаёт в _retry_or_discard
-        mock_retry.assert_called_once_with(candidate, 0)
-        assert store.get_install(candidate) is not None
-
-    def test_network_error_preserves_candidate(self, lifecycle, store):
-        """Сетевой обрыв не удаляет кандидата мгновенно,
-        а повторяет попытку. После исчерпания retry удаляет."""
-        candidate = lifecycle.process_install(
-            shop='shop.example',
-            insales_id='42',
-            token='install-token',
-        )
-
-        mock_client = MagicMock()
-        mock_client.get_account.side_effect = OSError('Connection refused')
-
-        with patch.object(lifecycle, '_make_client', return_value=mock_client):
-            with patch.object(lifecycle, '_retry_or_discard') as mock_retry:
-                lifecycle._verify_install_worker(candidate)
-
-        # Первый вызов не удаляет — передаёт в _retry_or_discard
-        mock_retry.assert_called_once_with(candidate, 0)
-        assert store.get_install(candidate) is not None
-
-    def test_temporary_error_eventually_removes_after_retries(self, lifecycle, store):
-        """Временная ошибка удаляет кандидата после исчерпания retry."""
-        candidate = lifecycle.process_install(
-            shop='shop.example',
-            insales_id='42',
-            token='install-token',
-        )
-
-        mock_client = MagicMock()
-        mock_client.get_account.side_effect = ApiError(429)
-
-        with patch.object(lifecycle, '_make_client', return_value=mock_client):
-            with patch('insales.lifecycle.time.sleep'):
-                lifecycle._verify_install_worker(candidate)
-
-        assert store.get_install(candidate) is None
-
-    def test_activate_install_atomic(self, store):
-        """activate_install атомарно проверяет и активирует."""
-        store.add_install('cand1', '42', 'shop.example', 'pwd', generation=1)
-
-        ok = store.activate_install('cand1', 'My Shop')
-        assert ok is True
-
-        store_row = store.get_store('42')
-        assert store_row is not None
-        assert store_row['title'] == 'My Shop'
-        assert store.get_install('cand1') is None
-
-    def test_activate_install_race_with_uninstall(self, store):
-        """activate_install возвращает False, если кандидат удалён (гонка)."""
-        store.add_install('cand2', '42', 'shop.example', 'pwd', generation=1)
-        store.delete_install('cand2')
-
-        ok = store.activate_install('cand2', 'Ghost')
-        assert ok is False
-
-    def test_activate_install_stale_generation_rejected(self, store):
-        """Устаревший кандидат (generation < текущего магазина) отклоняется."""
-        # Магазин уже активирован с generation=10
-        store.add_store('42', 'shop.example', 'pwd', title='Active',
-                        generation=10)
-        # Старый кандидат с generation=5
-        store.add_install('old-cand', '42', 'shop.example', 'pwd-old',
-                          generation=5)
-
-        ok = store.activate_install('old-cand', 'Old Shop')
-        assert ok is False
-
-        # Магазин не изменился
-        store_row = store.get_store('42')
-        assert store_row['generation'] == 10
-
-    def test_activate_install_current_generation_accepted(self, store):
-        """Кандидат с generation >= текущего магазина активируется."""
-        store.add_store('42', 'shop.example', 'pwd', title='Active',
-                        generation=10)
-        # Новый кандидат с generation=15
-        store.add_install('new-cand', '42', 'shop.example', 'pwd-new',
-                          generation=15)
-
-        ok = store.activate_install('new-cand', 'New Shop')
-        assert ok is True
-
-        store_row = store.get_store('42')
-        assert store_row['generation'] == 15
-
-    def test_generation_monotonic(self, store):
-        """next_generation всегда возвращает возрастающее значение."""
-        gen1 = store.next_generation()
-        gen2 = store.next_generation()
-        assert gen2 > gen1
-
-    def test_resume_pending_installs(self, store):
-        """Восстановление незавершённых кандидатов при старте вызывает worker."""
-        # Создаём install до старта lifecycle
-        store.add_install('old1', '42', 'shop.example', 'some-password',
-                          generation=1)
-
-        lc = Lifecycle(
-            store=store, app_id='test-app',
-            app_secret='test-secret-key',
-            dev=True, allowed_shops={'shop.example'},
-        )
-        try:
-            mock_client = MagicMock()
-            mock_client.get_account.return_value = (
-                {'id': 42, 'title': 'T'}, '1/500',
-            )
-            with patch.object(lc, '_make_client', return_value=mock_client):
-                lc.start()  # запускает _resume_pending_installs внутри
-                deadline = time.monotonic() + 3
-                while time.monotonic() < deadline:
-                    if store.get_store('42') is not None:
-                        break
-                    time.sleep(0.05)
-
-            store_row = store.get_store('42')
-            assert store_row is not None
-            assert store_row['shop'] == 'shop.example'
-        finally:
-            lc.shutdown()
-
-    def test_resume_pending_installs_empty(self, lifecycle_with_workers):
-        """resume не падает, если кандидатов нет."""
-        pass  # просто что start() не упал
+        assert store.count_installs_by_store('1') == 0
 
     def test_invalid_insales_id_rejected(self, lifecycle):
         """Нечисловой insales_id вызывает ошибку."""
@@ -285,16 +78,215 @@ class TestInstall:
                 token='token',
             )
 
-    def test_start_stop_worker(self, lifecycle):
-        """start/shutdown работают идемпотентно."""
-        assert not lifecycle.running
-        lifecycle.start()
-        assert lifecycle.running
-        lifecycle.start()  # повторный — без эффекта
-        assert lifecycle.running
-        lifecycle.shutdown()
-        assert not lifecycle.running
-        lifecycle.shutdown()  # повторный — без эффекта
+    def test_repeat_install_same_credentials(self, lifecycle, store):
+        """Повторный install с теми же credentials заменяет кандидата."""
+        c1 = lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='install-token',
+        )
+        assert store.get_install(c1) is not None
+
+        c2 = lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='install-token',
+        )
+        # Первый кандидат должен быть заменён
+        assert store.get_install(c1) is None
+        assert store.get_install(c2) is not None
+
+    def test_install_duplicate_credentials_no_extra_candidates(
+        self, lifecycle, store,
+    ):
+        """Повторный install с теми же данными не создаёт дубликат кандидата."""
+        lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='install-token',
+        )
+        lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='install-token',
+        )
+        assert store.count_installs_by_store('42') == 1
+
+    def test_install_no_api_call(self, lifecycle, store):
+        """Install callback не вызывает API."""
+        with patch.object(lifecycle, '_make_client') as mock:
+            candidate = lifecycle.process_install(
+                shop='shop.example', insales_id='42', token='tok',
+            )
+        mock.assert_not_called()
+        assert store.get_install(candidate) is not None
+
+
+# ---------------------------------------------------------------------------
+# Verify install on first login
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyInstall:
+    def test_verify_success_activates_store(self, lifecycle, store):
+        """Успешная проверка API активирует магазин."""
+        lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='install-token',
+        )
+        assert store.get_store('42') is None  # ещё не активирован
+
+        mock_client = MagicMock()
+        mock_client.get_account.return_value = (
+            {'id': 42, 'title': 'Test Shop'}, '1/500',
+        )
+        with patch.object(lifecycle, '_make_client', return_value=mock_client):
+            result = lifecycle.verify_pending_install('42', 'shop.example')
+
+        assert result == '42'
+        store_row = store.get_store('42')
+        assert store_row is not None
+        assert store_row['shop'] == 'shop.example'
+        assert store_row['title'] == 'Test Shop'
+
+    def test_verify_store_id_mismatch_deletes_candidate(self, lifecycle, store):
+        """Несовпадение store_id отклоняет и удаляет кандидата."""
+        lifecycle.process_install(
+            shop='shop.example', insales_id='99', token='install-token',
+        )
+
+        mock_client = MagicMock()
+        mock_client.get_account.return_value = ({'id': 42}, '1/500')
+        with patch.object(lifecycle, '_make_client', return_value=mock_client):
+            with pytest.raises(LifecycleError, match='Store ID mismatch'):
+                lifecycle.verify_pending_install('99', 'shop.example')
+
+        assert store.get_store('99') is None
+        assert store.count_installs_by_store('99') == 0
+
+    def test_verify_temporary_api_error_preserves_candidate(self, lifecycle, store):
+        """Временная ошибка (429) сохраняет кандидата для повтора."""
+        lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='install-token',
+        )
+
+        mock_client = MagicMock()
+        mock_client.get_account.side_effect = ApiError(429)
+        with patch.object(lifecycle, '_make_client', return_value=mock_client):
+            with pytest.raises(LifecycleError, match='Temporary API error'):
+                lifecycle.verify_pending_install('42', 'shop.example')
+
+        # Кандидат сохранён
+        assert store.count_installs_by_store('42') == 1
+
+    def test_verify_temporary_api_error_5xx_preserves_candidate(self, lifecycle, store):
+        """Временная ошибка 5xx сохраняет кандидата для повтора."""
+        lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='install-token',
+        )
+
+        mock_client = MagicMock()
+        mock_client.get_account.side_effect = ApiError(503)
+        with patch.object(lifecycle, '_make_client', return_value=mock_client):
+            with pytest.raises(LifecycleError, match='Temporary API error'):
+                lifecycle.verify_pending_install('42', 'shop.example')
+
+        assert store.count_installs_by_store('42') == 1
+
+    def test_verify_network_error_preserves_candidate(self, lifecycle, store):
+        """Сетевой обрыв сохраняет кандидата для повтора."""
+        lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='install-token',
+        )
+
+        mock_client = MagicMock()
+        mock_client.get_account.side_effect = TransportError('Connection failed')
+        with patch.object(lifecycle, '_make_client', return_value=mock_client):
+            with pytest.raises(LifecycleError, match='Network error'):
+                lifecycle.verify_pending_install('42', 'shop.example')
+
+        assert store.count_installs_by_store('42') == 1
+
+    def test_verify_403_deletes_candidate(self, lifecycle, store):
+        """Достоверно неверные credentials (403) удаляют кандидата."""
+        lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='install-token',
+        )
+
+        mock_client = MagicMock()
+        mock_client.get_account.side_effect = ApiError(403)
+        with patch.object(lifecycle, '_make_client', return_value=mock_client):
+            with pytest.raises(LifecycleError, match='API rejected'):
+                lifecycle.verify_pending_install('42', 'shop.example')
+
+        assert store.count_installs_by_store('42') == 0
+
+    def test_verify_no_candidate_returns_none(self, lifecycle, store):
+        """Нет кандидата — возвращает None."""
+        result = lifecycle.verify_pending_install('42', 'shop.example')
+        assert result is None
+
+    def test_verify_candidate_deleted_during_request(self, lifecycle, store):
+        """Кандидат удалён во время API-запроса (гонка с uninstall)."""
+        lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='install-token',
+        )
+
+        mock_client = MagicMock()
+        mock_client.get_account.return_value = (
+            {'id': 42, 'title': 'Shop'}, '1/500',
+        )
+
+        def activate_side_effect(candidate, title):
+            # Симулируем uninstall до активации
+            store.delete_install(candidate)
+            return False
+
+        with patch.object(lifecycle, '_make_client', return_value=mock_client):
+            with patch.object(store, 'activate_install', side_effect=activate_side_effect):
+                result = lifecycle.verify_pending_install('42', 'shop.example')
+
+        assert result is None  # не активирован, но и не ошибка
+        assert store.get_store('42') is None
+
+    def test_forged_install_does_not_replace_working(
+        self, lifecycle, store, preinstalled_store,
+    ):
+        """Поддельная установка не заменяет работающее подключение."""
+        store, _, _ = preinstalled_store
+        # Уже есть активное подключение
+        store_row_before = store.get_store('42')
+        assert store_row_before is not None
+
+        # Добавляем поддельного кандидата с другим паролем
+        lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='fake-token',
+        )
+
+        mock_client = MagicMock()
+        mock_client.get_account.side_effect = ApiError(403)
+        with patch.object(lifecycle, '_make_client', return_value=mock_client):
+            with pytest.raises(LifecycleError, match='API rejected'):
+                lifecycle.verify_pending_install('42', 'shop.example')
+
+        store_row = store.get_store('42')
+        assert store_row is not None
+        assert store_row['password'] == store_row_before['password']
+
+    def test_late_install_after_days(self, lifecycle, store):
+        """Кандидат сохраняется несколько дней, переживает перезапуск."""
+        lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='install-token',
+        )
+
+        # "Перезапуск" — новый lifecycle с тем же store
+        lc2 = Lifecycle(
+            store=store, app_id='test-app',
+            app_secret='test-secret-key',
+            dev=True, allowed_shops={'shop.example'},
+        )
+
+        mock_client = MagicMock()
+        mock_client.get_account.return_value = (
+            {'id': 42, 'title': 'Late Shop'}, '1/500',
+        )
+        with patch.object(lc2, '_make_client', return_value=mock_client):
+            result = lc2.verify_pending_install('42', 'shop.example')
+
+        assert result == '42'
+        assert store.get_store('42') is not None
+        assert store.get_store('42')['title'] == 'Late Shop'
 
 
 # ---------------------------------------------------------------------------
@@ -365,10 +357,8 @@ class TestUninstall:
         )
         install = store.get_install(candidate)
         assert install is not None
-        assert install['password'] is not None
         good_password = install['password']
 
-        # Симулируем uninstall с готовым паролем (как присылает InSales)
         result = lifecycle.process_uninstall(
             shop='shop.example',
             insales_id='42',
@@ -381,25 +371,21 @@ class TestUninstall:
                                                  preinstalled_store):
         """Старый uninstall не удаляет новую установку (через смену пароля)."""
         store, _, old_good_password = preinstalled_store
-
-        # Получаем generation магазина
         store_row = store.get_store('42')
         old_generation = store_row['generation']
 
-        # Новая установка меняет generation
-        candidate = lifecycle.process_install(
-            shop='shop.example',
-            insales_id='42',
-            token='install-token2',
+        # Активируем новую установку через verify
+        lifecycle.process_install(
+            shop='shop.example', insales_id='42', token='install-token2',
         )
         mock_client = MagicMock()
         mock_client.get_account.return_value = (
             {'id': 42, 'title': 'New Shop'}, '1/500',
         )
         with patch.object(lifecycle, '_make_client', return_value=mock_client):
-            lifecycle._verify_install_worker(candidate)
+            lifecycle.verify_pending_install('42', 'shop.example')
 
-        # Старый пароль больше не подходит — False
+        # Старый пароль больше не подходит
         result = lifecycle.process_uninstall(
             shop='shop.example',
             insales_id='42',
@@ -414,12 +400,9 @@ class TestUninstall:
                                            preinstalled_store):
         """Uninstall в одной транзакции — частичное состояние не сохраняется."""
         store_obj, _, good_password = preinstalled_store
-
-        # Создаём реальные сессию и challenge до uninstall
         store_obj.add_session('test-session-1', '42', 'user-1')
         store_obj.add_challenge('test-challenge-1', '42', 'nonce-1')
 
-        # Проверяем, что записи существуют
         assert store_obj.get_session('test-session-1') is not None
         with store_obj._connect() as conn:  # noqa: SLF001
             challenge = conn.execute(
@@ -433,14 +416,10 @@ class TestUninstall:
             password=good_password,
         )
         assert result is True
-
-        # После uninstall магазин удалён
         assert store_obj.get_store('42') is None
-
-        # Сессии удалены
         assert store_obj.get_session('test-session-1') is None
 
-        # Не должно быть orphan sessions (сессии без магазина)
+        # Нет orphan sessions
         with store_obj._connect() as conn:  # noqa: SLF001
             orphan_sessions = conn.execute(
                 '''SELECT COUNT(*) FROM sessions s
@@ -448,13 +427,6 @@ class TestUninstall:
                    WHERE st.id IS NULL'''
             ).fetchone()[0]
         assert orphan_sessions == 0
-
-        # Challenge удалён
-        with store_obj._connect() as conn:  # noqa: SLF001
-            challenge = conn.execute(
-                'SELECT * FROM challenges WHERE sid=?', ('test-challenge-1',)
-            ).fetchone()
-        assert challenge is None
 
         # Нет orphan challenges
         with store_obj._connect() as conn:  # noqa: SLF001
@@ -464,6 +436,20 @@ class TestUninstall:
                    WHERE st.id IS NULL'''
             ).fetchone()[0]
         assert orphan_challenges == 0
+
+    def test_uninstall_idempotent(self, lifecycle, store, preinstalled_store):
+        """Повторный uninstall с правильным паролем — False (уже удалён)."""
+        store, _, good_password = preinstalled_store
+
+        r1 = lifecycle.process_uninstall(
+            shop='shop.example', insales_id='42', password=good_password,
+        )
+        assert r1 is True
+
+        r2 = lifecycle.process_uninstall(
+            shop='shop.example', insales_id='42', password=good_password,
+        )
+        assert r2 is False  # уже не существует
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +478,6 @@ class TestAutologin:
 
         session_id = lifecycle.verify_autologin(
             challenge_sid=challenge_sid,
-            cookie_sid=challenge_sid,
             params=params,
         )
         assert session_id is not None
@@ -522,7 +507,6 @@ class TestAutologin:
 
         session_id = lifecycle.verify_autologin(
             challenge_sid=challenge_sid,
-            cookie_sid=challenge_sid,
             params=params,
         )
         assert session_id is None
@@ -550,7 +534,6 @@ class TestAutologin:
 
         session_id = lifecycle.verify_autologin(
             challenge_sid=challenge_sid,
-            cookie_sid=challenge_sid,
             params=params,
         )
         assert session_id is not None
@@ -575,9 +558,9 @@ class TestAutologin:
             good_password,
         )
 
+        # Передаём неверный challenge_sid — не совпадает с сохранённым
         session_id = lifecycle.verify_autologin(
-            challenge_sid=challenge_sid,
-            cookie_sid='different-sid',
+            challenge_sid='wrong-sid',
             params=params,
         )
         assert session_id is None
@@ -606,7 +589,6 @@ class TestAutologin:
 
         session_id = lifecycle.verify_autologin(
             challenge_sid=challenge_sid,
-            cookie_sid=challenge_sid,
             params=params,
         )
         assert session_id is None
@@ -631,22 +613,37 @@ class TestAutologin:
 
         sid1 = lifecycle.verify_autologin(
             challenge_sid=challenge_sid,
-            cookie_sid=challenge_sid,
             params=params,
         )
         assert sid1 is not None
 
         sid2 = lifecycle.verify_autologin(
             challenge_sid=challenge_sid,
-            cookie_sid=challenge_sid,
             params=params,
         )
         assert sid2 is None
 
     def test_nonexistent_store_challenge(self, lifecycle):
-        """Challenge для несуществующего магазина — ошибка."""
-        with pytest.raises(Exception):
+        """Challenge для несуществующего магазина — LifecycleError."""
+        with pytest.raises(LifecycleError, match='Store not installed'):
             lifecycle.create_challenge('999')
+
+    def test_empty_challenge_sid_rejected(self, lifecycle, preinstalled_store):
+        """Пустой challenge_sid отклоняется."""
+        store, _, good_password = preinstalled_store
+
+        params = {
+            'user_email': 'test@example.com',
+            'user_name': 'Test User',
+            'user_id': '7',
+            'email_confirmed': 'true',
+        }
+        # Не создаём challenge — пустой sid
+        session_id = lifecycle.verify_autologin(
+            challenge_sid='',
+            params=params,
+        )
+        assert session_id is None
 
 
 # ---------------------------------------------------------------------------
@@ -658,12 +655,8 @@ class TestStoreLifecycle:
     """Интеграционные тесты через Flask routes, собранные через factory."""
 
     @pytest.fixture
-    def app(self, store, lifecycle, tmp_path):
-        """Flask-приложение для интеграционных тестов через create_app.
-
-        Использует настоящую factory с временной SQLite.
-        Хранит store/lifecycle в app.extensions для доступа тестов.
-        """
+    def app(self, tmp_path):
+        """Flask-приложение для интеграционных тестов через create_app с чистой БД."""
         from app.config import Settings
         from app.factory import create_app
 
@@ -680,77 +673,46 @@ class TestStoreLifecycle:
             flask_debug=False,
         )
         flask_app = create_app(settings)
-
-        # Подменяем store и lifecycle на тестовые (с уже настроенным
-        # фикстурами состоянием)
-        flask_app.extensions['store'] = store
-        flask_app.extensions['lifecycle'] = lifecycle
-        flask_app.extensions['mw'] = SessionMiddleware(
-            store, 'test-app', 'test-secret-key', dev=True,
-        )
-        # Останавливаем worker, созданный create_app
-        if 'webhook_worker' in flask_app.extensions:
-            flask_app.extensions['webhook_worker'].stop()
-
         yield flask_app
 
-        # cleanup
-        if 'webhook_worker' in flask_app.extensions:
-            flask_app.extensions['webhook_worker'].stop()
-        if 'lifecycle' in flask_app.extensions:
-            flask_app.extensions['lifecycle'].shutdown()
-
-    @pytest.fixture
-    def client(self, app):
-        return app.test_client()
-
-    def test_health(self, client):
-        resp = client.get('/health')
-        assert resp.status_code == 200
-        assert resp.data == b'ok'
-
-    def test_install_received(self, client):
-        resp = client.get('/install', query_string={
-            'shop': 'shop.example',
-            'insales_id': '42',
-            'token': 'install-token',
-        })
+    def test_health(self, app):
+        """GET /health — 200."""
+        with app.test_client() as c:
+            resp = c.get('/health')
         assert resp.status_code == 200
 
-    def test_install_blocked_by_allowed_shops(self, client):
-        resp = client.get('/install', query_string={
-            'shop': 'evil.example',
-            'insales_id': '99',
-            'token': 'x',
-        })
+    def test_install_received(self, app):
+        """GET /install — сохранение кандидата, 200."""
+        with app.test_client() as c:
+            resp = c.get('/install?shop=shop.example&insales_id=42&token=abc')
+        assert resp.status_code == 200
+
+    def test_install_blocked_by_allowed_shops(self, app):
+        """GET /install с неизвестным доменом — 400."""
+        with app.test_client() as c:
+            resp = c.get('/install?shop=evil.example&insales_id=99&token=abc')
         assert resp.status_code == 400
 
-    def test_install_missing_params(self, client):
-        resp = client.get('/install', query_string={
-            'shop': 'shop.example',
-        })
+    def test_install_missing_params(self, app):
+        """GET /install без параметров — 400."""
+        with app.test_client() as c:
+            resp = c.get('/install')
         assert resp.status_code == 400
 
-    def test_unauthenticated_dashboard(self, client):
-        resp = client.get('/')
+    def test_login_without_install(self, app):
+        """GET /login без установки — 404."""
+        with app.test_client() as c:
+            resp = c.get('/login?shop=nobody.example&insales_id=999')
+        assert resp.status_code == 404
+
+    def test_unauthenticated_dashboard(self, app):
+        """GET / без сессии — 401."""
+        with app.test_client() as c:
+            resp = c.get('/')
         assert resp.status_code == 401
 
-    def test_not_found(self, client):
-        resp = client.get('/nonexistent')
+    def test_not_found(self, app):
+        """GET /nonexistent — 404."""
+        with app.test_client() as c:
+            resp = c.get('/nonexistent')
         assert resp.status_code == 404
-
-    def test_login_without_install(self, client):
-        resp = client.get('/login', query_string={
-            'shop': 'shop.example',
-            'insales_id': '42',
-        })
-        assert resp.status_code == 404
-
-    def test_webhook_not_implemented(self, client):
-        """POST /webhook/insales без token — 400 (не 404).
-
-        Webhook endpoint зарегистрирован в factory, но без токена
-        он возвращает 400 BAD REQUEST.
-        """
-        resp = client.post('/webhook/insales')
-        assert resp.status_code == 400

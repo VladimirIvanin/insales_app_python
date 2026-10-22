@@ -1,4 +1,4 @@
-"""Фикстуры для тестов Lifecycle."""
+"""Фикстуры для тестов."""
 from __future__ import annotations
 
 import json
@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from app.db.connection import upgrade as db_upgrade
 from insales.crypto import store_password
 from insales.lifecycle import Lifecycle
 from insales.store import Store
@@ -25,14 +26,15 @@ def tmp_db_path():
 
 @pytest.fixture
 def store(tmp_db_path):
-    """SQLite Store на временной БД."""
+    """SQLite Store на временной БД (схема накатывается явно)."""
+    db_upgrade(tmp_db_path)
     s = Store(tmp_db_path)
     yield s
 
 
 @pytest.fixture
 def lifecycle(store):
-    """Lifecycle с тестовыми credentials, worker'ы НЕ запущены."""
+    """Lifecycle с тестовыми credentials, без worker'ов."""
     lc = Lifecycle(
         store=store,
         app_id='test-app',
@@ -40,24 +42,7 @@ def lifecycle(store):
         dev=True,
         allowed_shops={'shop.example', 'another.shop'},
     )
-    # Не вызываем lc.start() — тесты делают это явно или работают без workers
     yield lc
-    lc.shutdown()
-
-
-@pytest.fixture
-def lifecycle_with_workers(store):
-    """Lifecycle с запущенными worker'ами."""
-    lc = Lifecycle(
-        store=store,
-        app_id='test-app',
-        app_secret='test-secret-key',
-        dev=True,
-        allowed_shops={'shop.example', 'another.shop'},
-    )
-    lc.start()
-    yield lc
-    lc.shutdown()
 
 
 @pytest.fixture

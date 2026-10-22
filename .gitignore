@@ -11,8 +11,12 @@ runtime/
 
 # Virtual environment
 .venv/
+.venv-tmp/
 venv/
 env/
+
+# Root artifacts (e.g. empty files from typos)
+=*,
 
 # Python cache
 __pycache__/

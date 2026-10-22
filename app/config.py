@@ -76,6 +76,6 @@ class Settings:
             flask_secret_key=os.environ.get(
                 'FLASK_SECRET_KEY', os.urandom(32).hex(),
             ),
-            flask_debug=os.environ.get('FLASK_ENV') == 'development',
+            flask_debug=os.environ.get('FLASK_DEBUG', '0') == '1',
             runtime_dir=runtime_dir,
         )

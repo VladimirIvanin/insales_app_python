@@ -7,19 +7,13 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION_TABLE = '''
-    CREATE TABLE IF NOT EXISTS _schema_version (
-        version INTEGER PRIMARY KEY,
-        applied_at REAL NOT NULL
-    );
-'''
-
 # Миграции: (номер, описание, файл.sql или inline SQL)
 MIGRATIONS: list[tuple[int, str, str]] = [
     (1, 'Начальная схема', '0001_initial.sql'),
     (2, 'Добавлен generation в sessions', '0002_sessions_generation.sql'),
     (3, 'Webhook-подписки и inbox', '0003_webhooks.sql'),
     (4, 'Tombstones для отменённых установок', '0004_store_tombstones.sql'),
+    (5, 'Удаление webhook-таблиц', '0005_remove_webhooks.sql'),
 ]
 
 _SCHEMA_DIR = Path(__file__).parent / 'migrations'
@@ -30,10 +24,13 @@ class MigrationError(Exception):
 
 
 def _current_version(conn: sqlite3.Connection) -> int:
-    row = conn.execute(
-        'SELECT COALESCE(MAX(version), 0) FROM _schema_version'
-    ).fetchone()
-    return row[0]
+    try:
+        row = conn.execute(
+            'SELECT COALESCE(MAX(version), 0) FROM _schema_version'
+        ).fetchone()
+        return row[0]
+    except sqlite3.OperationalError:
+        return 0
 
 
 def _migration_0002_sql(conn: sqlite3.Connection) -> str | None:
@@ -52,12 +49,11 @@ def _migration_0002_sql(conn: sqlite3.Connection) -> str | None:
 
 
 def _apply_migration(conn: sqlite3.Connection, version: int,
-                     sql: str | None, already_in_transaction: bool = False) -> None:
+                     sql: str | None) -> None:
     """Применить миграцию.
 
     Если sql=None — SQL не выполняется (колонка уже существует),
     записываем только версию схемы.
-    Если already_in_transaction=True — вызывающий уже открыл BEGIN IMMEDIATE.
     """
     try:
         if sql is not None:
@@ -69,12 +65,16 @@ def _apply_migration(conn: sqlite3.Connection, version: int,
             'INSERT OR IGNORE INTO _schema_version (version, applied_at) VALUES (?, ?)',
             (version, time.time()),
         )
-    except Exception:
-        raise
+    except Exception as exc:
+        raise MigrationError(f'Migration {version} failed') from exc
 
 
 def upgrade(db_path: Path) -> None:
-    """Применить все неприменённые миграции к БД."""
+    """Применить все неприменённые миграции к БД.
+
+    Создаёт каталог для БД при необходимости.
+    Может вызываться многократно — идемпотентна.
+    """
     db_path = Path(db_path).resolve()
     db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -82,7 +82,14 @@ def upgrade(db_path: Path) -> None:
     try:
         conn.execute('PRAGMA journal_mode=WAL')
         conn.execute('PRAGMA foreign_keys=ON')
-        conn.executescript(SCHEMA_VERSION_TABLE)
+
+        # Создаём таблицу версий схемы, если её нет
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS _schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at REAL NOT NULL
+            )
+        ''')
 
         # Захватываем write-блокировку до всех проверок схемы
         conn.execute('BEGIN IMMEDIATE')
@@ -115,7 +122,7 @@ def upgrade(db_path: Path) -> None:
             else:
                 sql = source
 
-            _apply_migration(conn, version, sql, already_in_transaction=True)
+            _apply_migration(conn, version, sql)
 
         conn.commit()
     finally:
@@ -123,14 +130,13 @@ def upgrade(db_path: Path) -> None:
 
 
 def status(db_path: Path) -> list[dict]:
-    """Показать статус миграций.
+    """Показать статус миграций без изменения схемы.
 
-    Если база данных не существует (файл или каталог отсутствует),
-    возвращает статус нулевой версии вместо ошибки соединения.
+    Не создаёт _schema_version таблицу — если её нет, все миграции
+    считаются неприменёнными (current = 0).
     """
     db_path = Path(db_path).resolve()
-    if not db_path.parent.exists():
-        # Родительский каталог не создан — база ещё не инициализирована
+    if not db_path.exists():
         result = []
         for version, desc, _ in MIGRATIONS:
             result.append({
@@ -148,7 +154,6 @@ def status(db_path: Path) -> list[dict]:
     try:
         conn = sqlite3.connect(str(db_path), timeout=5)
     except sqlite3.OperationalError:
-        # База недоступна (например, отсутствует каталог)
         result = []
         for version, desc, _ in MIGRATIONS:
             result.append({
@@ -165,7 +170,6 @@ def status(db_path: Path) -> list[dict]:
 
     try:
         conn.execute('PRAGMA journal_mode=WAL')
-        conn.executescript(SCHEMA_VERSION_TABLE)
         current = _current_version(conn)
     finally:
         conn.close()
@@ -186,12 +190,16 @@ def status(db_path: Path) -> list[dict]:
 
 
 @contextmanager
-def connect(db_path: Path) -> Generator[sqlite3.Connection, None, None]:
-    """Открыть подключение, гарантируя, что схема актуальна."""
-    from app.db.connection import upgrade as run_upgrade
+def connect_raw(db_path: Path) -> Generator[sqlite3.Connection, None, None]:
+    """Открыть подключение к SQLite без вызова миграций.
 
+    Не выполняет DDL — вызывающий должен накатить upgrade до
+    открытия соединения (через app.db.connection.upgrade или
+    из create_app).
+
+    Устанавливает WAL и foreign_keys.
+    """
     db_path = Path(db_path).resolve()
-    run_upgrade(db_path)
 
     conn = sqlite3.connect(str(db_path), timeout=5)
     conn.row_factory = sqlite3.Row
