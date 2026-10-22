@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from app.integrations.insales.subscriptions import SubscriptionService
 
 INSTALL_WORKERS = 2
+MAX_CANDIDATES_PER_SHOP = 5
 CHALLENGE_TTL = 300  # 5 минут
 SESSION_TTL = 3600  # 1 час
 
@@ -83,6 +84,35 @@ class Lifecycle:
         for install in self.store.list_installs():
             self._workers.submit(self._verify_install_worker, install['candidate'])
 
+        # Восстановить подписки для магазинов, где они отсутствуют
+        self._resume_missing_subscriptions()
+
+    def _resume_missing_subscriptions(self) -> None:
+        """Проверить и восстановить webhook-подписки для активных магазинов."""
+        if self._subscription_service is None:
+            return
+        for store_row in self.store.list_stores():
+            store_id = store_row['id']
+            store_data = self.store.get_store(store_id)
+            if store_data is None:
+                continue
+            # Подписки будут созданы при первом обращении к ним
+            # через проверку в register_defaults
+            try:
+                client = self._make_client(
+                    store_data['shop'], store_data['password'],
+                )
+                self._subscription_service.register_defaults(
+                    client, store_id, store_data['generation'],
+                )
+            except Exception:
+                import logging
+                log = logging.getLogger(__name__)
+                log.exception(
+                    'Failed to restore subscriptions for store %s',
+                    store_id,
+                )
+
     # ---- Install ----
 
     def process_install(self, shop: str, insales_id: str,
@@ -106,6 +136,10 @@ class Lifecycle:
             raise ValueError('ALLOWED_SHOPS is empty — installation rejected')
         if shop not in self.allowed_shops:
             raise ValueError(f'Shop {shop} is not in ALLOWED_SHOPS')
+
+        # Throttling: ограничить число незавершённых candidates на магазин
+        if len(self.store.list_installs_by_shop(shop)) >= MAX_CANDIDATES_PER_SHOP:
+            raise ValueError(f'Too many pending installs for shop {shop}')
 
         password = store_password(token, self.app_secret)
         candidate = secrets.token_urlsafe(32)
@@ -192,8 +226,12 @@ class Lifecycle:
     # ---- Uninstall ----
 
     def process_uninstall(self, shop: str, insales_id: str,
-                          token: str) -> bool:
+                          password: str) -> bool:
         """Обработать uninstall callback.
+
+        InSales присылает в uninstall уже готовый пароль
+        ``MD5(install_token + app_secret)`` — тот же, что был сохранён
+        при install. Повторное хэширование не требуется.
 
         Валидирует shop/пароль, затем атомарно удаляет магазин,
         сессии, challenge'и и кандидатов в одной write-транзакции.
@@ -204,7 +242,6 @@ class Lifecycle:
         Возвращает True при успешном удалении, False если магазин не найден.
         """
         shop = validate_shop(shop)
-        password = store_password(token, self.app_secret)
 
         # Сначала проверяем, может это ещё не активированный кандидат?
         store_row = self.store.get_store_shop_and_password(insales_id)

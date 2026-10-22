@@ -103,7 +103,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     webhook_dispatcher = WebhookDispatcher()
     webhook_dispatcher.register('orders/create', handle_order_create)
     webhook_dispatcher.register('orders/update', handle_order_update)
-    webhook_dispatcher.register('orders/delete', handle_order_delete)
+    webhook_dispatcher.register('orders/destroy', handle_order_delete)
 
     webhook_receiver = WebhookReceiver(webhook_subs, webhook_inbox)
 

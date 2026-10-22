@@ -222,6 +222,15 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_installs_by_shop(self, shop: str) -> list[StoreRow]:
+        """Список незавершённых установок для магазина (для throttling)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                'SELECT * FROM installs WHERE shop=? ORDER BY created_at DESC',
+                (shop,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def activate_install(self, candidate: str, title: str) -> bool:
         """Атомарная активация: проверяет, что кандидат — актуального поколения.
 

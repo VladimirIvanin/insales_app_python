@@ -36,12 +36,18 @@ def _current_version(conn: sqlite3.Connection) -> int:
 
 
 def _migration_0002_sql(conn: sqlite3.Connection) -> str | None:
-    """Проверить, нужно ли добавить generation в sessions."""
+    """Проверить, нужно ли добавить generation в sessions.
+
+    Вызывается после применения миграции 1 (таблица sessions уже создана
+    в текущей транзакции conn).
+    """
     try:
-        conn.execute('SELECT generation FROM sessions LIMIT 0')
-        return None  # колонка уже есть
+        cols = conn.execute('PRAGMA table_info(sessions)').fetchall()
+        if any(col[1] == 'generation' for col in cols):
+            return None  # колонка уже есть
     except sqlite3.OperationalError:
-        return 'ALTER TABLE sessions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;'
+        pass  # таблицы нет — будет создана миграцией 1
+    return 'ALTER TABLE sessions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;'
 
 
 def _apply_migration(conn: sqlite3.Connection, version: int,
@@ -52,8 +58,6 @@ def _apply_migration(conn: sqlite3.Connection, version: int,
     записываем только версию схемы.
     Если already_in_transaction=True — вызывающий уже открыл BEGIN IMMEDIATE.
     """
-    if not already_in_transaction:
-        conn.execute('BEGIN IMMEDIATE')
     try:
         if sql is not None:
             for statement in sql.split(';'):
@@ -64,11 +68,7 @@ def _apply_migration(conn: sqlite3.Connection, version: int,
             'INSERT OR IGNORE INTO _schema_version (version, applied_at) VALUES (?, ?)',
             (version, time.time()),
         )
-        if not already_in_transaction:
-            conn.commit()
     except Exception:
-        if not already_in_transaction:
-            conn.rollback()
         raise
 
 
@@ -100,15 +100,13 @@ def upgrade(db_path: Path) -> None:
             if version <= current:
                 continue
 
-            # Откатываем блокировку перед каждой миграцией,
-            # _apply_migration откроет свою
-            conn.commit()
-
+            # Подготовка SQL
             if version == 2:
                 sql = _migration_0002_sql(conn)
             elif source.endswith('.sql'):
                 sql_path = _SCHEMA_DIR / source
                 if not sql_path.exists():
+                    conn.rollback()
                     raise MigrationError(
                         f'Migration file not found: {sql_path}'
                     )
@@ -116,13 +114,9 @@ def upgrade(db_path: Path) -> None:
             else:
                 sql = source
 
-            _apply_migration(conn, version, sql)
-            # Перезахватываем для следующей итерации цикла
-            conn.execute('BEGIN IMMEDIATE')
+            _apply_migration(conn, version, sql, already_in_transaction=True)
 
-        if current == latest:
-            # Не было миграций — снимаем захваченную блокировку
-            conn.commit()
+        conn.commit()
     finally:
         conn.close()
 

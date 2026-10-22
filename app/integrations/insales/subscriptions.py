@@ -11,7 +11,7 @@ from app.repositories.webhook_subscriptions import (
     WebhookSubscriptions,
 )
 from insales.client import InSalesClient
-from insales.errors import ApiError
+from insales.errors import ApiError, TransportError
 from insales.transport import RetryStrategy
 
 
@@ -19,16 +19,16 @@ class SubscriptionService:
     """Бизнес-логика управления webhook-подписками."""
 
     # Темы, на которые приложение подписывается по умолчанию
+    # Допустимые темы InSales: orders/create, orders/update, orders/destroy,
+    # products/create, products/update, client/create, client/update
     DEFAULT_TOPICS = [
         'orders/create',
         'orders/update',
-        'orders/delete',
+        'orders/destroy',
         'products/create',
         'products/update',
-        'products/delete',
-        'clients/create',
-        'clients/update',
-        'clients/delete',
+        'client/create',
+        'client/update',
     ]
 
     def __init__(self, subscriptions: WebhookSubscriptions,
@@ -41,6 +41,9 @@ class SubscriptionService:
                            store_id: str, generation: int) -> list[SubscriptionRow]:
         """Зарегистрировать стандартный набор подписок.
 
+        Пропускает темы, для которых уже есть активная подписка
+        текущего поколения (устойчив к повторным вызовам).
+
         1. Создать локальную подписку.
         2. Создать удалённую через API.
         3. Сохранить insales_id.
@@ -50,6 +53,12 @@ class SubscriptionService:
         """
         results: list[SubscriptionRow] = []
         for topic in self.DEFAULT_TOPICS:
+            # Пропускаем, если подписка уже существует
+            existing = self._subs.get_by_store_and_topic(store_id, topic)
+            if existing is not None and existing['state'] == 'active':
+                if existing.get('generation', 0) == generation:
+                    continue
+
             sub = self.register_topic(client, store_id, generation, topic)
             if sub:
                 results.append(sub)
@@ -110,7 +119,7 @@ class SubscriptionService:
                 import time
                 time.sleep(delay)
                 continue
-            except OSError:
+            except (OSError, TransportError):
                 return None
         return None
 

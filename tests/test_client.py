@@ -148,13 +148,16 @@ class TestTransport:
                 transport.get('/admin/account.json')
 
     def test_dev_mode_http_only_for_loopback(self):
+        from http.client import HTTPConnection, HTTPSConnection
+
         loopback = Transport('127.0.0.1', 'app', 'pwd', dev=True)
         conn = loopback._connect()
-        assert isinstance(conn, type(conn))  # HTTPConnection
+        assert isinstance(conn, HTTPConnection)
+        assert not isinstance(conn, HTTPSConnection)
 
         external = Transport('shop.example', 'app', 'pwd', dev=True)
         conn2 = external._connect()
-        assert isinstance(conn2, type(conn2))  # HTTPSConnection
+        assert isinstance(conn2, HTTPSConnection)
 
     def test_verify_identity_match(self, transport):
         conn = self._mock_response()

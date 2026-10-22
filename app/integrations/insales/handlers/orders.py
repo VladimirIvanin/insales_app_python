@@ -45,7 +45,7 @@ def handle_order_create(store_id: str, generation: int,
 
 def handle_order_delete(store_id: str, generation: int,
                          topic: str, payload: Any) -> bool:
-    """Обработать событие orders/delete."""
+    """Обработать событие orders/destroy."""
     order_id = None
     if isinstance(payload, dict):
         order_id = payload.get('id')

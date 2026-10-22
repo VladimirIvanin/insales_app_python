@@ -283,7 +283,7 @@ class TestUninstall:
     def test_uninstall_with_correct_token(self, lifecycle, store,
                                            preinstalled_store):
         """Правильный пароль удаляет магазин, candidate и данные."""
-        store, raw_token, _ = preinstalled_store
+        store, _, good_password = preinstalled_store
         store.add_challenge('ch1', '42', 'nonce1')
         store.add_session('sess1', '42', 'user1', ttl=3600)
         store.add_install('cand1', '42', 'shop.example', 'pwd')
@@ -291,7 +291,7 @@ class TestUninstall:
         result = lifecycle.process_uninstall(
             shop='shop.example',
             insales_id='42',
-            token=raw_token,
+            password=good_password,
         )
         assert result is True
         assert store.get_store('42') is None
@@ -305,7 +305,7 @@ class TestUninstall:
             lifecycle.process_uninstall(
                 shop='shop.example',
                 insales_id='42',
-                token='0' * 32,
+                password='0' * 32,
             )
         assert store.get_store('42') is not None
 
@@ -314,21 +314,21 @@ class TestUninstall:
         result = lifecycle.process_uninstall(
             shop='shop.example',
             insales_id='999',
-            token='anything',
+            password='anything',
         )
         assert result is False
 
     def test_uninstall_removes_candidates(self, lifecycle, store,
                                            preinstalled_store):
         """Uninstall удаляет все кандидаты для этого store_id."""
-        store, raw_token, _ = preinstalled_store
+        store, _, good_password = preinstalled_store
         store.add_install('c1', '42', 'shop.example', 'pwd')
         store.add_install('c2', '42', 'shop.example', 'pwd')
 
         lifecycle.process_uninstall(
             shop='shop.example',
             insales_id='42',
-            token=raw_token,
+            password=good_password,
         )
         assert store.get_install('c1') is None
         assert store.get_install('c2') is None
@@ -343,12 +343,13 @@ class TestUninstall:
         install = store.get_install(candidate)
         assert install is not None
         assert install['password'] is not None
+        good_password = install['password']
 
-        # Симулируем uninstall с тем же токеном, что и install
+        # Симулируем uninstall с готовым паролем (как присылает InSales)
         result = lifecycle.process_uninstall(
             shop='shop.example',
             insales_id='42',
-            token='install-token',
+            password=good_password,
         )
         assert result is True
         assert store.get_install(candidate) is None
@@ -356,7 +357,7 @@ class TestUninstall:
     def test_uninstall_new_install_not_affected(self, lifecycle, store,
                                                  preinstalled_store):
         """Старый uninstall не удаляет новую установку (через generation)."""
-        store, raw_token, good_password = preinstalled_store
+        store, _, old_good_password = preinstalled_store
 
         # Получаем generation магазина
         store_row = store.get_store('42')
@@ -375,13 +376,13 @@ class TestUninstall:
         with patch.object(lifecycle, '_make_client', return_value=mock_client):
             lifecycle._verify_install_worker(candidate)
 
-        # Теперь пробуем uninstall со СТАРЫМ raw token (должен не совпасть,
+        # Теперь пробуем uninstall со СТАРЫМ паролем (должен не совпасть,
         # т.к. пароль изменился при переустановке)
         with pytest.raises(LifecycleError, match='Invalid uninstall token'):
             lifecycle.process_uninstall(
                 shop='shop.example',
                 insales_id='42',
-                token=raw_token,
+                password=old_good_password,
             )
         # Новая установка жива
         assert store.get_store('42') is not None
@@ -390,14 +391,14 @@ class TestUninstall:
     def test_uninstall_atomic_transaction(self, lifecycle, store,
                                            preinstalled_store):
         """Uninstall в одной транзакции — частичное состояние не сохраняется."""
-        store, raw_token, _ = preinstalled_store
+        store, _, good_password = preinstalled_store
 
         # Если бы транзакция не была атомарной — могли бы остаться
         # сессии без магазина
         result = lifecycle.process_uninstall(
             shop='shop.example',
             insales_id='42',
-            token=raw_token,
+            password=good_password,
         )
         assert result is True
 
