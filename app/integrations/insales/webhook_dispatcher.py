@@ -46,6 +46,10 @@ class WebhookDispatcher:
 
         Returns:
             True, если обработка успешна.
+            False, если handler не найден или вернул False.
+
+        Raises:
+            Exception: Исключение от handler'а (worker обрабатывает как временную ошибку).
         """
         handler = self._handlers.get(topic)
         if handler is None:
@@ -53,11 +57,7 @@ class WebhookDispatcher:
                          topic, store_id)
             return False
 
-        try:
-            return handler(store_id, generation, topic, payload)
-        except Exception as exc:
-            log.error('Handler %s failed: %s', topic, exc, exc_info=True)
-            return False
+        return handler(store_id, generation, topic, payload)
 
     def has_handler(self, topic: str) -> bool:
         """Проверить, зарегистрирован ли handler для темы."""

@@ -91,7 +91,7 @@ class TestResourceBase:
 class TestValidateShop:
     def test_valid_shop(self):
         assert validate_shop('shop.example') == 'shop.example'
-        assert validate_shop('ABC.INSALES.IO') == 'abc.insales.io'
+        assert validate_shop('SHOP.EXAMPLE') == 'shop.example'
 
     def test_invalid_shop(self):
         with pytest.raises(ValueError):

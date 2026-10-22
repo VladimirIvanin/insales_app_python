@@ -120,16 +120,30 @@ class SubscriptionService:
         """Сверить локальную подписку с удалённым списком.
 
         Вызывается, когда создание подписки через API дало неопределённый
-        результат. Ищет вебхук по теме и обновляет insales_id.
+        результат. Ищет вебхук по теме И точному адресу callback,
+        чтобы не присвоить чужой вебхук того же магазина/темы.
         """
+        expected_address = sub.get('address', '')
         try:
             hooks = client.webhooks.list(per_page=250)
             for hook in hooks:
-                if hook.get('topic') == topic:
-                    hook_id = hook.get('id')
-                    if hook_id is not None:
-                        self._subs.update_insales_id(sub['id'], hook_id)
-                    return sub
+                if hook.get('topic') != topic:
+                    continue
+                # Проверяем точное совпадение адреса callback
+                hook_address = hook.get('address', '')
+                if hook_address and expected_address:
+                    if hook_address == expected_address:
+                        hook_id = hook.get('id')
+                        if hook_id is not None:
+                            self._subs.update_insales_id(sub['id'], hook_id)
+                        return sub
+                    # Адрес не совпадает — это чужой вебхук, пропускаем
+                    continue
+                # Если адрес не сохранён (старая подписка) — fallback на topic
+                hook_id = hook.get('id')
+                if hook_id is not None:
+                    self._subs.update_insales_id(sub['id'], hook_id)
+                return sub
         except (ApiError, OSError):
             pass
 

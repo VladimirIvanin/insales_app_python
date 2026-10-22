@@ -88,40 +88,74 @@ class WebhookInbox:
             )
             return cur.rowcount > 0
 
-    def release(self, inbox_id: int) -> bool:
-        """Освободить событие (снять блокировку)."""
+    def release(self, inbox_id: int, owner: str | None = None) -> bool:
+        """Освободить событие (снять блокировку).
+
+        Если указан owner, освобождение выполняется только при совпадении.
+        """
         with self._store._connect() as conn:  # noqa: SLF001
-            cur = conn.execute(
-                '''UPDATE webhook_inbox
-                   SET locked_at=NULL, locked_by=NULL,
-                       updated_at=julianday("now")
-                   WHERE id=?''',
-                (inbox_id,),
-            )
+            if owner is not None:
+                cur = conn.execute(
+                    '''UPDATE webhook_inbox
+                       SET locked_at=NULL, locked_by=NULL,
+                           updated_at=julianday("now")
+                       WHERE id=? AND locked_by=?''',
+                    (inbox_id, owner),
+                )
+            else:
+                cur = conn.execute(
+                    '''UPDATE webhook_inbox
+                       SET locked_at=NULL, locked_by=NULL,
+                           updated_at=julianday("now")
+                       WHERE id=?''',
+                    (inbox_id,),
+                )
             return cur.rowcount > 0
 
-    def mark_success(self, inbox_id: int) -> bool:
-        """Пометить событие как успешно обработанное."""
+    def mark_success(self, inbox_id: int, owner: str | None = None) -> bool:
+        """Пометить событие как успешно обработанное.
+
+        Если указан owner, обновление выполняется только при совпадении
+        locked_by (защита от stale owner).
+        """
         with self._store._connect() as conn:  # noqa: SLF001
-            cur = conn.execute(
-                '''UPDATE webhook_inbox
-                   SET state='processed', locked_at=NULL, locked_by=NULL,
-                       next_attempt_at=NULL,
-                       updated_at=julianday("now")
-                   WHERE id=?''',
-                (inbox_id,),
-            )
+            if owner is not None:
+                cur = conn.execute(
+                    '''UPDATE webhook_inbox
+                       SET state='processed', locked_at=NULL, locked_by=NULL,
+                           next_attempt_at=NULL,
+                           updated_at=julianday("now")
+                       WHERE id=? AND locked_by=?''',
+                    (inbox_id, owner),
+                )
+            else:
+                cur = conn.execute(
+                    '''UPDATE webhook_inbox
+                       SET state='processed', locked_at=NULL, locked_by=NULL,
+                           next_attempt_at=NULL,
+                           updated_at=julianday("now")
+                       WHERE id=?''',
+                    (inbox_id,),
+                )
             return cur.rowcount > 0
 
     def mark_failed(self, inbox_id: int,
-                    error: str, permanent: bool = False) -> bool:
+                    error: str, permanent: bool = False,
+                    owner: str | None = None) -> bool:
         """Пометить событие как ошибочное.
 
         Если permanent=True — событие переводится в 'failed' без повтора.
         Иначе — увеличивается счётчик попыток и планируется повтор.
+
+        Если указан owner, обновление выполняется только при совпадении
+        locked_by (защита от stale owner).
         """
         row = self.get(inbox_id)
         if row is None:
+            return False
+
+        # Проверка owner после чтения (защита от записи stale owner)
+        if owner is not None and row.get('locked_by') != owner:
             return False
 
         attempts = row['attempts'] + 1
@@ -134,14 +168,24 @@ class WebhookInbox:
             next_attempt = time.time() + delay
 
         with self._store._connect() as conn:  # noqa: SLF001
-            cur = conn.execute(
-                '''UPDATE webhook_inbox
-                   SET state=?, attempts=?, error=?,
-                       next_attempt_at=?, locked_at=NULL, locked_by=NULL,
-                       updated_at=julianday("now")
-                   WHERE id=?''',
-                (new_state, attempts, error, next_attempt, inbox_id),
-            )
+            if owner is not None:
+                cur = conn.execute(
+                    '''UPDATE webhook_inbox
+                       SET state=?, attempts=?, error=?,
+                           next_attempt_at=?, locked_at=NULL, locked_by=NULL,
+                           updated_at=julianday("now")
+                       WHERE id=? AND locked_by=?''',
+                    (new_state, attempts, error, next_attempt, inbox_id, owner),
+                )
+            else:
+                cur = conn.execute(
+                    '''UPDATE webhook_inbox
+                       SET state=?, attempts=?, error=?,
+                           next_attempt_at=?, locked_at=NULL, locked_by=NULL,
+                           updated_at=julianday("now")
+                       WHERE id=?''',
+                    (new_state, attempts, error, next_attempt, inbox_id),
+                )
             return cur.rowcount > 0
 
     def cancel_by_store(self, store_id: str) -> int:

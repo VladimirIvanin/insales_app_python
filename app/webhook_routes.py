@@ -23,16 +23,22 @@ log = logging.getLogger(__name__)
 MAX_CONTENT_LENGTH = 1_100_000
 
 
-def create_webhook_routes(receiver: WebhookReceiver) -> Blueprint:
+def create_webhook_routes(receiver: WebhookReceiver,
+                           max_content_length: int | None = None) -> Blueprint:
     """Создать blueprint с webhook endpoint'ами.
 
     Args:
         receiver: WebhookReceiver для обработки уведомлений.
+        max_content_length: Максимальный размер тела запроса в байтах.
+                            По умолчанию 1_100_000.
 
     Returns:
         Blueprint для регистрации в Flask-приложении.
     """
-    blueprint = Blueprint('webhooks', __name__)
+    if max_content_length is None:
+        max_content_length = MAX_CONTENT_LENGTH
+
+    blueprint = Blueprint('webhooks', __name__, static_folder=None)
 
     @blueprint.route('/webhook/insales', methods=['POST'])
     def webhook_receive():

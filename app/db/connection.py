@@ -77,16 +77,20 @@ def upgrade(db_path: Path) -> None:
     db_path = Path(db_path).resolve()
     db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(db_path), timeout=5)
+    conn = sqlite3.connect(str(db_path), timeout=30)
     try:
         conn.execute('PRAGMA journal_mode=WAL')
         conn.execute('PRAGMA foreign_keys=ON')
         conn.executescript(SCHEMA_VERSION_TABLE)
 
+        # Захватываем write-блокировку до всех проверок схемы
+        conn.execute('BEGIN IMMEDIATE')
+
         current = _current_version(conn)
         latest = max(v for v, _, _ in MIGRATIONS) if MIGRATIONS else 0
 
         if current > latest:
+            conn.rollback()
             raise MigrationError(
                 f'Database schema version {current} is newer than '
                 f'application supports ({latest}). Downgrade is not supported.'
@@ -95,6 +99,10 @@ def upgrade(db_path: Path) -> None:
         for version, _desc, source in MIGRATIONS:
             if version <= current:
                 continue
+
+            # Откатываем блокировку перед каждой миграцией,
+            # _apply_migration откроет свою
+            conn.commit()
 
             if version == 2:
                 sql = _migration_0002_sql(conn)
@@ -109,6 +117,12 @@ def upgrade(db_path: Path) -> None:
                 sql = source
 
             _apply_migration(conn, version, sql)
+            # Перезахватываем для следующей итерации цикла
+            conn.execute('BEGIN IMMEDIATE')
+
+        if current == latest:
+            # Не было миграций — снимаем захваченную блокировку
+            conn.commit()
     finally:
         conn.close()
 

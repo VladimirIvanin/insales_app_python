@@ -90,12 +90,20 @@ Worker запускается автоматически при старте с�
 
 ```python
 # app/integrations/insales/handlers/orders.py
-from app.integrations.insales.webhook_dispatcher import handler
+from app.integrations.insales.webhook_dispatcher import HandlerFunc
 
-@handler('orders/paid')
-def handle_order_paid(store_id: str, generation: int, topic: str, payload: dict) -> bool:
+def handle_order_paid(store_id: str, generation: int, topic: str,
+                      payload: dict) -> bool:
     # Ваша бизнес-логика
     return True  # True = успех, False = ошибка (без повтора)
+```
+
+Регистрация handler'а в `app/factory.py`:
+
+```python
+from app.integrations.insales.handlers.orders import handle_order_paid
+
+webhook_dispatcher.register('orders/paid', handle_order_paid)
 ```
 
 ## CLI-команды

@@ -67,7 +67,7 @@ def cmd_doctor(settings: Settings) -> int:
     checks = [
         ('INSALES_APP_ID', settings.app_id),
         ('INSALES_APP_SECRET', '***' if settings.app_secret else ''),
-        ('APP_BASE_URL', settings.app_base_url),
+        ('APP_BASE_URL', settings.base_url),
     ]
     for name, value in checks:
         if value:
@@ -123,13 +123,20 @@ def cmd_doctor(settings: Settings) -> int:
                 shop = s.get('shop', '?')
                 store_id = s.get('id', '?')
                 try:
+                    # Получаем полные credentials магазина (с паролем)
+                    full = store.get_store(store_id)
+                    password = full['password'] if full else ''
+                    if not password:
+                        print(f'  ✗ Магазин #{store_id}: {shop} — нет credentials')
+                        issues += 1
+                        continue
                     client = InSalesClient(
                         shop=shop,
                         app_id=settings.app_id,
-                        password=s.get('password', ''),
-                        dev=settings.local_demo,
+                        password=password,
+                        dev=settings.dev,
                     )
-                    account = client.account.get()
+                    account = client.get_account()[0]
                     title = account.get('title', shop)
                     print(f'  ✓ Магазин #{store_id}: {title} ({shop})')
                 except Exception as exc:

@@ -135,6 +135,36 @@ class Store:
                 (candidate, store_id, shop, password, generation),
             )
 
+    def reserve_generation_and_add_install(self, candidate: str,
+                                            store_id: str,
+                                            shop: str,
+                                            password: str) -> int:
+        """Атомарно зарезервировать поколение и вставить кандидата.
+
+        Выполняется в одной write-транзакции (BEGIN IMMEDIATE),
+        что исключает race condition при конкурентных установках.
+
+        Returns:
+            Зарезервированное значение generation.
+        """
+        with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            now_ms = int(time.time() * 1000)
+            last = conn.execute(
+                'SELECT COALESCE(MAX(generation), 0) FROM stores'
+            ).fetchone()[0]
+            last_install = conn.execute(
+                'SELECT COALESCE(MAX(generation), 0) FROM installs'
+            ).fetchone()[0]
+            generation = max(now_ms, last + 1, last_install + 1)
+            conn.execute(
+                '''INSERT OR REPLACE INTO installs
+                   (candidate, store_id, shop, password, generation, created_at)
+                   VALUES (?, ?, ?, ?, ?, julianday("now"))''',
+                (candidate, store_id, shop, password, generation),
+            )
+            return generation
+
     def get_install(self, candidate: str) -> StoreRow | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -143,10 +173,30 @@ class Store:
         return dict(row) if row else None
 
     def get_install_by_store_id(self, store_id: str) -> StoreRow | None:
-        """Получить установку по store_id (для uninstall до активации)."""
+        """Получить установку по store_id (для uninstall до активации).
+
+        При нескольких кандидатах возвращает последний (максимальный generation).
+        """
         with self._connect() as conn:
             row = conn.execute(
-                'SELECT * FROM installs WHERE store_id=?', (store_id,)
+                'SELECT * FROM installs WHERE store_id=? '
+                'ORDER BY generation DESC LIMIT 1', (store_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_install_by_store_shop_and_password(
+        self, store_id: str, shop: str, password: str
+    ) -> StoreRow | None:
+        """Получить установку по store_id + shop + password.
+
+        При нескольких кандидатах возвращает последний (максимальный generation).
+        Используется для uninstall, чтобы отличить корректный кандидат.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                'SELECT * FROM installs WHERE store_id=? AND shop=? AND password=? '
+                'ORDER BY generation DESC LIMIT 1',
+                (store_id, shop, password),
             ).fetchone()
         return dict(row) if row else None
 

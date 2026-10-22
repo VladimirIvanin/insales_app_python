@@ -62,9 +62,13 @@ def lifecycle_with_workers(store):
 
 @pytest.fixture
 def preinstalled_store(store, lifecycle):
-    """Предустановленный магазин в БД."""
+    """Предустановленный магазин в БД.
+
+    Возвращает (store, raw_token, good_password).
+    """
+    raw_token = VECTORS['install']['install_token']
     good_password = store_password(
-        VECTORS['install']['install_token'],
+        raw_token,
         VECTORS['install']['app_secret'],
     )
     store.add_store(
@@ -73,4 +77,4 @@ def preinstalled_store(store, lifecycle):
         password=good_password,
         title='Test Shop',
     )
-    return store, good_password
+    return store, raw_token, good_password

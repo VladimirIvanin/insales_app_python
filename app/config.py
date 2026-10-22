@@ -58,7 +58,7 @@ class Settings:
                 'ALLOWED_SHOPS must contain at least one domain.'
             )
 
-        db_raw = os.environ.get('APP_DB', 'runtime/app.sqlite3')
+        db_raw = os.environ.get('APP_DB', 'app.sqlite3')
         # Если относительный — резолвим от runtime_dir
         db_path = Path(db_raw)
         if not db_path.is_absolute():

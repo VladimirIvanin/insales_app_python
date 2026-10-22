@@ -2,8 +2,6 @@
 
 Содержит формулы подписей для install (MD5 пароля магазина)
 и autologin (token/token2/token3) согласно документации InSales.
-
-Основание: references/lifecycle.md в insales-partner-app-expert.
 """
 import hashlib
 import hmac

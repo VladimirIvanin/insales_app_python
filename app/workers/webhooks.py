@@ -11,9 +11,13 @@ import logging
 import os
 import time
 from threading import Event, Thread
+from typing import TYPE_CHECKING
 
 from app.integrations.insales.webhook_dispatcher import WebhookDispatcher
 from app.repositories.webhook_inbox import WebhookInbox
+
+if TYPE_CHECKING:
+    from insales.store import Store
 
 log = logging.getLogger(__name__)
 
@@ -27,11 +31,13 @@ class WebhookWorker:
 
     def __init__(self, inbox: WebhookInbox,
                  dispatcher: WebhookDispatcher,
+                 store: Store | None = None,
                  poll_interval: float = 1.0,
                  batch_size: int = 10,
                  worker_id: str | None = None):
         self._inbox = inbox
         self._dispatcher = dispatcher
+        self._store = store
         self._poll_interval = poll_interval
         self._batch_size = batch_size
         self._worker_id = worker_id or f'wh-{os.getpid()}-{time.time():.0f}'
@@ -85,7 +91,8 @@ class WebhookWorker:
         2. Если захват не удался — пропустить (другой worker уже взял).
         3. Вызвать dispatcher.
         4. При успехе — mark_success.
-        5. При ошибке — mark_failed (с повтором или без).
+        5. Если handler не найден или вернул False — mark_failed (permanent).
+        6. При исключении handler'а — mark_failed (с повтором).
         """
         event_id = event['id']
 
@@ -97,6 +104,34 @@ class WebhookWorker:
         generation = event['generation']
         topic = event['topic']
         payload = event.get('payload', '{}')
+
+        # Проверка: магазин всё ещё существует и поколение актуально
+        if self._store is not None:
+            store_row = self._store.get_store(store_id)
+            if store_row is None:
+                log.warning(
+                    'Store %s not found (uninstalled), cancelling event %s',
+                    store_id, event_id,
+                )
+                self._inbox.mark_failed(
+                    event_id,
+                    error='Store not found',
+                    permanent=True,
+                )
+                return
+            if store_row['generation'] > generation:
+                log.warning(
+                    'Store %s generation %d > event generation %d, '
+                    'cancelling stale event %s',
+                    store_id, store_row['generation'], generation, event_id,
+                )
+                self._inbox.mark_failed(
+                    event_id,
+                    error=f'Stale generation: event={generation}, '
+                          f'current={store_row["generation"]}',
+                    permanent=True,
+                )
+                return
 
         import json
         try:
@@ -114,7 +149,7 @@ class WebhookWorker:
             )
 
             if success:
-                self._inbox.mark_success(event_id)
+                self._inbox.mark_success(event_id, owner=self._worker_id)
                 log.debug('Event %s processed: topic=%s store=%s',
                            event_id, topic, store_id)
             else:
@@ -123,11 +158,13 @@ class WebhookWorker:
                     event_id,
                     error=f'No handler for topic: {topic}',
                     permanent=True,
+                    owner=self._worker_id,
                 )
         except Exception as exc:
-            log.error('Event %s failed: %s', event_id, exc, exc_info=True)
+            log.error('Event %s handler raised: %s', event_id, exc, exc_info=True)
             self._inbox.mark_failed(
                 event_id,
                 error=str(exc)[:500],
                 permanent=False,
+                owner=self._worker_id,
             )

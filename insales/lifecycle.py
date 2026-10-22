@@ -9,6 +9,7 @@ from __future__ import annotations
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING
 
 from insales.client import InSalesClient
 from insales.crypto import (
@@ -18,9 +19,12 @@ from insales.crypto import (
     sign_token3,
     store_password,
 )
-from insales.errors import ApiError
+from insales.errors import ApiError, TransportError
 from insales.store import Store
 from insales.transport import validate_shop
+
+if TYPE_CHECKING:
+    from app.integrations.insales.subscriptions import SubscriptionService
 
 INSTALL_WORKERS = 2
 CHALLENGE_TTL = 300  # 5 минут
@@ -41,7 +45,8 @@ class Lifecycle:
 
     def __init__(self, store: Store, app_id: str, app_secret: str,
                  dev: bool = False,
-                 allowed_shops: set[str] | None = None):
+                 allowed_shops: set[str] | None = None,
+                 subscription_service: SubscriptionService | None = None):
         self.store = store
         self.app_id = app_id
         self.app_secret = app_secret
@@ -49,6 +54,7 @@ class Lifecycle:
         self.allowed_shops = allowed_shops or set()
         # Запрещаем пустой allowlist — используется в store.py
         # (проверяется также в app/config.py)
+        self._subscription_service = subscription_service
         self._workers: ThreadPoolExecutor | None = None
 
     # ---- Управление worker'ами ----
@@ -104,12 +110,10 @@ class Lifecycle:
         password = store_password(token, self.app_secret)
         candidate = secrets.token_urlsafe(32)
 
-        # Поколение: монотонный счётчик из БД
-        with self.store._connect() as conn:  # noqa: SLF001
-            generation = self.store.next_generation(conn)
-
-        self.store.add_install(candidate, insales_id, shop, password,
-                               generation=generation)
+        # Атомарно: резервируем поколение и вставляем кандидата
+        self.store.reserve_generation_and_add_install(
+            candidate, insales_id, shop, password,
+        )
         if self._workers is not None:
             self._workers.submit(self._verify_install_worker, candidate)
         return candidate
@@ -117,6 +121,31 @@ class Lifecycle:
     def _make_client(self, shop: str, password: str) -> InSalesClient:
         """Создать клиент API для магазина. Выделено для тестов."""
         return InSalesClient(shop, self.app_id, password, dev=self.dev)
+
+    def _create_default_subscriptions(self, client: InSalesClient,
+                                       store_id: str,
+                                       generation: int) -> None:
+        """Создать стандартные webhook-подписки после активации."""
+        if self._subscription_service is None:
+            import logging
+            log = logging.getLogger(__name__)
+            log.warning(
+                'SubscriptionService not configured — '
+                'webhook subscriptions not created for store %s',
+                store_id,
+            )
+            return
+        try:
+            self._subscription_service.register_defaults(
+                client, store_id, generation,
+            )
+        except Exception:
+            import logging
+            log = logging.getLogger(__name__)
+            log.exception(
+                'Failed to create webhook subscriptions for store %s',
+                store_id,
+            )
 
     def _verify_install_worker(self, candidate: str) -> None:
         """Фоновая верификация кандидата установки."""
@@ -138,7 +167,10 @@ class Lifecycle:
             ok = self.store.activate_install(candidate,
                                              account.get('title', 'Store'))
             if ok:
-                pass  # активировано
+                # Активировано — создаём webhook-подписки
+                self._create_default_subscriptions(
+                    client, install['store_id'], install['generation'],
+                )
             return
 
         except ApiError as exc:
@@ -146,6 +178,9 @@ class Lifecycle:
                 # Временная ошибка — оставляем кандидата для повтора при рестарте
                 return
             self.store.delete_install(candidate)
+            return
+        except TransportError:
+            # Сетевая ошибка транспорта — временная, оставляем кандидата
             return
         except (OSError, ValueError):
             # Сетевой обрыв, невалидный JSON — временные, оставляем кандидата
@@ -169,28 +204,27 @@ class Lifecycle:
         Возвращает True при успешном удалении, False если магазин не найден.
         """
         shop = validate_shop(shop)
+        password = store_password(token, self.app_secret)
 
         # Сначала проверяем, может это ещё не активированный кандидат?
         store_row = self.store.get_store_shop_and_password(insales_id)
         if store_row is None:
             # Магазина нет — возможно, есть только pending install?
-            install = self.store.get_install_by_store_id(insales_id)
+            # Ищем кандидата по store_id + shop + password
+            install = self.store.get_install_by_store_shop_and_password(
+                insales_id, shop, password,
+            )
             if install is not None:
-                if (
-                    install['shop'] == shop
-                    and secure_compare(token, install['password'])
-                ):
-                    # Атомарно удаляем этот кандидат
-                    return self.store.consume_install_by_store_password(
-                        insales_id, install['password']
-                    )
-                raise LifecycleError('Invalid uninstall token for pending install')
+                # Атомарно удаляем этот кандидат
+                return self.store.consume_install_by_store_password(
+                    insales_id, install['password']
+                )
             return False
 
         if store_row['shop'] != shop:
             raise ValueError('Shop mismatch')
 
-        if not secure_compare(token, store_row['password']):
+        if not secure_compare(password, store_row['password']):
             raise LifecycleError('Invalid uninstall token')
 
         # Единая транзакция удаления с проверкой generation
