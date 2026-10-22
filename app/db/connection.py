@@ -19,6 +19,7 @@ MIGRATIONS: list[tuple[int, str, str]] = [
     (1, 'Начальная схема', '0001_initial.sql'),
     (2, 'Добавлен generation в sessions', '0002_sessions_generation.sql'),
     (3, 'Webhook-подписки и inbox', '0003_webhooks.sql'),
+    (4, 'Tombstones для отменённых установок', '0004_store_tombstones.sql'),
 ]
 
 _SCHEMA_DIR = Path(__file__).parent / 'migrations'
@@ -110,7 +111,7 @@ def upgrade(db_path: Path) -> None:
                     raise MigrationError(
                         f'Migration file not found: {sql_path}'
                     )
-                sql = sql_path.read_text()
+                sql = sql_path.read_text(encoding='utf-8')
             else:
                 sql = source
 

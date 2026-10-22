@@ -28,11 +28,12 @@ dev = [
 insales-app = "app.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["insales*", "app*", "app.db*", "app.db.migrations*"]
+include = ["insales*", "app*", "app.db*", "app.db.migrations*", "tests*"]
 
 [tool.setuptools.package-data]
 "app" = ["templates/*.html"]
 "app.db.migrations" = ["*.sql"]
+"tests" = ["*.json", "conftest.py"]
 
 [tool.ruff]
 target-version = "py310"

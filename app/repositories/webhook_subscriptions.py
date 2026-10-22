@@ -31,8 +31,13 @@ class WebhookSubscriptions:
                base_url: str, format_type: str = 'json') -> SubscriptionRow:
         """Создать локальную подписку до регистрации в InSales.
 
+        Внутри одной транзакции: UPSERT + SELECT по store_id+topic.
+        Возвращает актуальную запись — secret может быть унаследован
+        от существующей подписки того же поколения, если это повтор
+        после временного сбоя удалённого создания.
+
         Returns:
-            Созданная запись подписки.
+            Созданная или обновлённая запись подписки.
         """
         secret = self._generate_secret()
         address = self._build_address(base_url, secret)
@@ -74,8 +79,19 @@ class WebhookSubscriptions:
                  address, format_type),
             )
 
-        # После upsert читаем именно созданную запись по secret
-        return self.get_by_secret(secret)
+            row = conn.execute(
+                'SELECT * FROM webhook_subscriptions '
+                'WHERE store_id=? AND topic=?',
+                (store_id, topic),
+            ).fetchone()
+
+        if row is None:
+            msg = (
+                f'Subscription not found after upsert: '
+                f'store_id={store_id!r}, topic={topic!r}'
+            )
+            raise RuntimeError(msg)
+        return dict(row)
 
     def get(self, sub_id: int) -> SubscriptionRow | None:
         """Получить подписку по ID."""
@@ -116,14 +132,29 @@ class WebhookSubscriptions:
         return [dict(r) for r in rows]
 
     def update_insales_id(self, sub_id: int,
-                           insales_id: int) -> bool:
-        """Сохранить ID вебхука InSales после удалённого создания."""
+                           insales_id: int,
+                           expected_secret: str | None = None) -> bool:
+        """Сохранить ID вебхука InSales после удалённого создания.
+
+        Если expected_secret передан — обновляет строку только если
+        её callback_secret совпадает. Защита от B3: когда старый
+        ответ записывает remote ID в подписку нового поколения,
+        у которой другой secret.
+        """
         with self._store._connect() as conn:  # noqa: SLF001
-            cur = conn.execute(
-                'UPDATE webhook_subscriptions SET insales_id=?, '
-                'updated_at=julianday("now") WHERE id=?',
-                (insales_id, sub_id),
-            )
+            if expected_secret is not None:
+                cur = conn.execute(
+                    '''UPDATE webhook_subscriptions SET insales_id=?,
+                       updated_at=julianday("now")
+                       WHERE id=? AND callback_secret=?''',
+                    (insales_id, sub_id, expected_secret),
+                )
+            else:
+                cur = conn.execute(
+                    'UPDATE webhook_subscriptions SET insales_id=?, '
+                    'updated_at=julianday("now") WHERE id=?',
+                    (insales_id, sub_id),
+                )
             return cur.rowcount > 0
 
     def mark_inactive(self, sub_id: int) -> bool:

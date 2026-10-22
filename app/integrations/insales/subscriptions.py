@@ -96,10 +96,13 @@ class SubscriptionService:
             # Не удалось создать — возможно уже существует
             return self._reconcile(client, sub, topic)
 
-        # Шаг 3: сохраняем insales_id
+        # Шаг 3: сохраняем insales_id с проверкой secret (защита от B3)
         remote_id = remote.get('id')
         if remote_id is not None:
-            self._subs.update_insales_id(sub['id'], remote_id)
+            self._subs.update_insales_id(
+                sub['id'], remote_id,
+                expected_secret=sub['callback_secret'],
+            )
 
         return sub
 
@@ -138,6 +141,7 @@ class SubscriptionService:
         чтобы не присвоить чужой вебхук того же магазина/темы.
         """
         expected_address = sub.get('address', '')
+        expected_secret = sub.get('callback_secret', '')
         try:
             hooks = client.webhooks.list(per_page=250)
             for hook in hooks:
@@ -149,14 +153,20 @@ class SubscriptionService:
                     if hook_address == expected_address:
                         hook_id = hook.get('id')
                         if hook_id is not None:
-                            self._subs.update_insales_id(sub['id'], hook_id)
+                            self._subs.update_insales_id(
+                                sub['id'], hook_id,
+                                expected_secret=expected_secret,
+                            )
                         return sub
                     # Адрес не совпадает — это чужой вебхук, пропускаем
                     continue
                 # Если адрес не сохранён (старая подписка) — fallback на topic
                 hook_id = hook.get('id')
                 if hook_id is not None:
-                    self._subs.update_insales_id(sub['id'], hook_id)
+                    self._subs.update_insales_id(
+                        sub['id'], hook_id,
+                        expected_secret=expected_secret,
+                    )
                 return sub
         except (ApiError, OSError):
             pass

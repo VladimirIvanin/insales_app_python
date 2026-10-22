@@ -20,10 +20,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from flask import Flask
 
 from app.middleware import SessionMiddleware
-from app.routes import create_routes
 from insales.client import ApiError
 from insales.crypto import sign_token3
 from insales.lifecycle import Lifecycle
@@ -415,10 +413,20 @@ class TestUninstall:
     def test_uninstall_atomic_transaction(self, lifecycle, store,
                                            preinstalled_store):
         """Uninstall в одной транзакции — частичное состояние не сохраняется."""
-        store, _, good_password = preinstalled_store
+        store_obj, _, good_password = preinstalled_store
 
-        # Если бы транзакция не была атомарной — могли бы остаться
-        # сессии без магазина
+        # Создаём реальные сессию и challenge до uninstall
+        store_obj.add_session('test-session-1', '42', 'user-1')
+        store_obj.add_challenge('test-challenge-1', '42', 'nonce-1')
+
+        # Проверяем, что записи существуют
+        assert store_obj.get_session('test-session-1') is not None
+        with store_obj._connect() as conn:  # noqa: SLF001
+            challenge = conn.execute(
+                'SELECT * FROM challenges WHERE sid=?', ('test-challenge-1',)
+            ).fetchone()
+        assert challenge is not None
+
         result = lifecycle.process_uninstall(
             shop='shop.example',
             insales_id='42',
@@ -426,14 +434,36 @@ class TestUninstall:
         )
         assert result is True
 
-        # После uninstall не должно быть сессий без магазина
-        with store._connect() as conn:  # noqa: SLF001
+        # После uninstall магазин удалён
+        assert store_obj.get_store('42') is None
+
+        # Сессии удалены
+        assert store_obj.get_session('test-session-1') is None
+
+        # Не должно быть orphan sessions (сессии без магазина)
+        with store_obj._connect() as conn:  # noqa: SLF001
             orphan_sessions = conn.execute(
                 '''SELECT COUNT(*) FROM sessions s
                    LEFT JOIN stores st ON s.store_id = st.id
                    WHERE st.id IS NULL'''
             ).fetchone()[0]
         assert orphan_sessions == 0
+
+        # Challenge удалён
+        with store_obj._connect() as conn:  # noqa: SLF001
+            challenge = conn.execute(
+                'SELECT * FROM challenges WHERE sid=?', ('test-challenge-1',)
+            ).fetchone()
+        assert challenge is None
+
+        # Нет orphan challenges
+        with store_obj._connect() as conn:  # noqa: SLF001
+            orphan_challenges = conn.execute(
+                '''SELECT COUNT(*) FROM challenges c
+                   LEFT JOIN stores st ON c.store_id = st.id
+                   WHERE st.id IS NULL'''
+            ).fetchone()[0]
+        assert orphan_challenges == 0
 
 
 # ---------------------------------------------------------------------------
@@ -628,20 +658,47 @@ class TestStoreLifecycle:
     """Интеграционные тесты через Flask routes, собранные через factory."""
 
     @pytest.fixture
-    def app(self, store, lifecycle):
-        """Flask-приложение для интеграционных тестов (без workers)."""
-        flask_app = Flask(__name__,
-                          template_folder=str(
-                              Path(__file__).parent.parent / 'app' / 'templates'
-                          ))
-        flask_app.secret_key = 'test-secret'
-        mw = SessionMiddleware(store, 'test-app', 'test-secret-key', dev=True)
-        blueprint = create_routes(
-            store, lifecycle, mw,
+    def app(self, store, lifecycle, tmp_path):
+        """Flask-приложение для интеграционных тестов через create_app.
+
+        Использует настоящую factory с временной SQLite.
+        Хранит store/lifecycle в app.extensions для доступа тестов.
+        """
+        from app.config import Settings
+        from app.factory import create_app
+
+        settings = Settings(
+            app_id='test-app',
+            app_secret='test-secret',
             base_url='http://demo.example',
+            dev=True,
+            allowed_shops=frozenset({'shop.example'}),
+            db_path=tmp_path / 'test_integration.sqlite3',
+            bind_host='127.0.0.1',
+            port=8765,
+            flask_secret_key='test-secret',
+            flask_debug=False,
         )
-        flask_app.register_blueprint(blueprint)
+        flask_app = create_app(settings)
+
+        # Подменяем store и lifecycle на тестовые (с уже настроенным
+        # фикстурами состоянием)
+        flask_app.extensions['store'] = store
+        flask_app.extensions['lifecycle'] = lifecycle
+        flask_app.extensions['mw'] = SessionMiddleware(
+            store, 'test-app', 'test-secret-key', dev=True,
+        )
+        # Останавливаем worker, созданный create_app
+        if 'webhook_worker' in flask_app.extensions:
+            flask_app.extensions['webhook_worker'].stop()
+
         yield flask_app
+
+        # cleanup
+        if 'webhook_worker' in flask_app.extensions:
+            flask_app.extensions['webhook_worker'].stop()
+        if 'lifecycle' in flask_app.extensions:
+            flask_app.extensions['lifecycle'].shutdown()
 
     @pytest.fixture
     def client(self, app):
@@ -690,5 +747,10 @@ class TestStoreLifecycle:
         assert resp.status_code == 404
 
     def test_webhook_not_implemented(self, client):
+        """POST /webhook/insales без token — 400 (не 404).
+
+        Webhook endpoint зарегистрирован в factory, но без токена
+        он возвращает 400 BAD REQUEST.
+        """
         resp = client.post('/webhook/insales')
-        assert resp.status_code == 404
+        assert resp.status_code == 400

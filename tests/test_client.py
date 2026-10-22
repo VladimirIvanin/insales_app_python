@@ -15,6 +15,18 @@ from insales.transport import (
 )
 
 
+def _verify_request(conn, method: str, path: str) -> None:
+    """Проверить, что conn.request был вызван с ожидаемым method и path.
+
+    Используется в URL-тестах для проверки wire-контракта (Q3).
+    """
+    conn.request.assert_called_once()
+    args, _ = conn.request.call_args
+    actual_method, actual_path = args[0], args[1]
+    assert actual_method == method, f'Expected method {method!r}, got {actual_method!r}'
+    assert actual_path == path, f'Expected path {path!r}, got {actual_path!r}'
+
+
 class TestResourceBase:
     """Тесты базового класса Resource: URL-сборка и query string."""
 
@@ -230,6 +242,7 @@ class TestInSalesClient:
         with patch.object(client._transport, '_connect', return_value=conn):
             account = client.account.get()
         assert account == {'id': 1}
+        _verify_request(conn, 'GET', '/admin/account.json')
 
     def test_orders_get_url(self, client):
         """Orders.get(123) обращается к /admin/orders/123.json."""
@@ -237,6 +250,7 @@ class TestInSalesClient:
         with patch.object(client._transport, '_connect', return_value=conn):
             order = client.orders.get(123)
         assert order == {'id': 1}
+        _verify_request(conn, 'GET', '/admin/orders/123.json')
 
     def test_orders_list_url(self, client):
         """Orders.list() обращается с query params."""
@@ -244,6 +258,7 @@ class TestInSalesClient:
         with patch.object(client._transport, '_connect', return_value=conn):
             orders = client.orders.list(page=1, per_page=50)
         assert orders == [{'id': 1}]
+        _verify_request(conn, 'GET', '/admin/orders.json?page=1&per_page=50')
 
     def test_orders_list_not_a_list_raises(self, client):
         """Orders.list() кидает ResourceError, если ответ не список."""
@@ -265,6 +280,7 @@ class TestInSalesClient:
         with patch.object(client._transport, '_connect', return_value=conn):
             count = client.orders.count()
         assert count == 42
+        _verify_request(conn, 'GET', '/admin/orders/count.json')
 
     def test_orders_count_missing_field_raises(self, client):
         """Orders.count() кидает ResourceError при отсутствии 'count'."""
@@ -279,6 +295,7 @@ class TestInSalesClient:
         with patch.object(client._transport, '_connect', return_value=conn):
             order = client.orders.update(123, {'order': {'status': 'paid'}})
         assert order['status'] == 'paid'
+        _verify_request(conn, 'PUT', '/admin/orders/123.json')
 
     def test_products_get_url(self, client):
         """Products.get(456) обращается к /admin/products/456.json."""
@@ -286,6 +303,7 @@ class TestInSalesClient:
         with patch.object(client._transport, '_connect', return_value=conn):
             product = client.products.get(456)
         assert product['id'] == 456
+        _verify_request(conn, 'GET', '/admin/products/456.json')
 
     def test_products_count_url(self, client):
         """Products.count() обращается к /admin/products/count.json."""
@@ -293,6 +311,7 @@ class TestInSalesClient:
         with patch.object(client._transport, '_connect', return_value=conn):
             count = client.products.count()
         assert count == 10
+        _verify_request(conn, 'GET', '/admin/products/count.json')
 
     def test_webhooks_get_url(self, client):
         """Webhooks.get(789) обращается к /admin/webhooks/789.json."""
@@ -300,6 +319,7 @@ class TestInSalesClient:
         with patch.object(client._transport, '_connect', return_value=conn):
             wh = client.webhooks.get(789)
         assert wh['id'] == 789
+        _verify_request(conn, 'GET', '/admin/webhooks/789.json')
 
     def test_webhooks_delete_raises_on_error(self, client):
         """Webhooks.delete() пробрасывает ошибки API."""
@@ -315,6 +335,7 @@ class TestInSalesClient:
         with patch.object(client._transport, '_connect', return_value=conn):
             wh = client.webhooks.create('orders/create', 'http://hook.example')
         assert wh['id'] == 1
+        _verify_request(conn, 'POST', '/admin/webhooks.json')
 
 
 class TestRetryStrategy:

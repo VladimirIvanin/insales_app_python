@@ -263,11 +263,13 @@ class Store:
 
         В одной транзакции:
         1. Читает кандидата
-        2. Проверяет, что generation кандидата >= текущего generation магазина
+        2. Проверяет tombstone — не был ли этот store_id отменён
+           после создания кандидата (защита от B2).
+        3. Проверяет, что generation кандидата >= текущего generation магазина
            (предотвращает активацию устаревшего кандидата)
-        3. Удаляет старые сессии/challenge
-        4. Заменяет/создаёт запись магазина
-        5. Удаляет кандидата
+        4. Удаляет старые сессии/challenge
+        5. Заменяет/создаёт запись магазина
+        6. Удаляет кандидата
 
         Возвращает True при успешной активации, False если кандидат
         был удалён или устарел (гонка с uninstall или повторной установкой).
@@ -281,11 +283,23 @@ class Store:
                 return False
 
             install_gen = install['generation']
+            store_id = install['store_id']
+
+            # Проверка tombstone: не был ли магазин отменён после создания кандидата
+            tombstone = conn.execute(
+                'SELECT generation FROM store_tombstones WHERE store_id=?',
+                (store_id,),
+            ).fetchone()
+            if tombstone is not None:
+                if install_gen <= tombstone['generation']:
+                    conn.execute('DELETE FROM installs WHERE candidate=?',
+                                 (candidate,))
+                    return False
 
             # Проверить, что generation кандидата не меньше текущего магазина
             store_row = conn.execute(
                 'SELECT generation FROM stores WHERE id=?',
-                (install['store_id'],),
+                (store_id,),
             ).fetchone()
             if store_row is not None and install_gen < store_row['generation']:
                 # Устаревший кандидат — удаляем, не активируем
@@ -341,6 +355,11 @@ class Store:
         в одной write-транзакции, но только если generation совпадает
         (защита от race condition при переустановке).
 
+        Фиксирует tombstone (store_id, generation), чтобы отклонить
+        запоздалую активацию кандидата (см. B2). Удаляет installs всех
+        поколений — после uninstall ни один кандидат не должен
+        активироваться.
+
         Возвращает True, если магазин был удалён.
         """
         with self._connect() as conn:
@@ -358,6 +377,11 @@ class Store:
             conn.execute('DELETE FROM challenges WHERE store_id=?', (store_id,))
             conn.execute('DELETE FROM installs WHERE store_id=?', (store_id,))
             conn.execute('DELETE FROM stores WHERE id=?', (store_id,))
+            conn.execute(
+                'INSERT OR IGNORE INTO store_tombstones (store_id, generation) '
+                'VALUES (?, ?)',
+                (store_id, expected_generation),
+            )
             return True
 
     def uninstall_store_or_pending_install(
@@ -395,16 +419,18 @@ class Store:
                     return False
                 from insales.crypto import secure_compare
                 if secure_compare(password, store_row['password']):
-                    # Active store найден с совпадающим паролем — удаляем всё,
-                    # но только installs своего поколения (чтобы не уничтожить
-                    # pending кандидата от новой установки)
+                    # Active store найден с совпадающим паролем — удаляем всё.
+                    # Удаляем installs всех поколений, чтобы запоздалый
+                    # worker не активировал кандидата (см. B2).
                     conn.execute('DELETE FROM sessions WHERE store_id=?', (store_id,))
                     conn.execute('DELETE FROM challenges WHERE store_id=?', (store_id,))
+                    conn.execute('DELETE FROM installs WHERE store_id=?', (store_id,))
+                    conn.execute('DELETE FROM stores WHERE id=?', (store_id,))
                     conn.execute(
-                        'DELETE FROM installs WHERE store_id=? AND generation=?',
+                        'INSERT OR IGNORE INTO store_tombstones (store_id, generation) '
+                        'VALUES (?, ?)',
                         (store_id, store_row['generation']),
                     )
-                    conn.execute('DELETE FROM stores WHERE id=?', (store_id,))
                     return True
                 # Active store есть, но пароль не совпал (другой установщик).
                 # Проверяем pending install с matching credentials.

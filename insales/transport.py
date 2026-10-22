@@ -122,18 +122,30 @@ class Transport:
         try:
             conn.request(method, path, body=body, headers=headers)
             response = conn.getresponse()
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
 
-            resp_headers = dict(response.getheaders())
-            usage = response.getheader('API-Usage-Limit')
+            # S3: проверяем, что ответ полный (защита от раннего EOF)
+            content_length = response.getheader('Content-Length')
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+            if content_length is not None:
+                try:
+                    expected = int(content_length)
+                    if len(raw) < expected and len(raw) <= MAX_RESPONSE_BYTES:
+                        raise TransportError(
+                            f'Incomplete response: read {len(raw)} of '
+                            f'{expected} bytes (possible network truncation)',
+                        )
+                except (ValueError, TypeError):
+                    pass
 
             if len(raw) > MAX_RESPONSE_BYTES:
                 raise ResponseTooLargeError(
                     status=response.status,
                     body='Response exceeds maximum allowed size',
-                    usage=usage,
+                    usage=response.getheader('API-Usage-Limit'),
                 )
 
+            resp_headers = dict(response.getheaders())
+            usage = response.getheader('API-Usage-Limit')
 
             if response.status not in _OK_STATUSES:
                 retry_after = response.getheader('Retry-After')
@@ -152,6 +164,10 @@ class Transport:
                 except json.JSONDecodeError as exc:
                     raise ResourceError(
                         f'Failed to decode JSON response: {exc}',
+                    ) from exc
+                except UnicodeDecodeError as exc:
+                    raise ResourceError(
+                        f'Response contains invalid UTF-8 bytes: {exc}',
                     ) from exc
 
             return ApiResponse(
