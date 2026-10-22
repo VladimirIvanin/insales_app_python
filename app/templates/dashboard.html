@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Приложение InSales</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: #f0f4f8; color: #1a2332; line-height: 1.6;
+    min-height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    background: linear-gradient(135deg, #165dcc 0%, #1a73e8 100%);
+    color: white; padding: 24px 32px;
+  }
+  header h1 { font-size: 1.5rem; font-weight: 600; }
+  main {
+    flex: 1; max-width: 800px; margin: 32px auto; padding: 0 24px; width: 100%;
+  }
+  .card {
+    background: white; border-radius: 12px; padding: 32px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 20px;
+  }
+  .card h2 { font-size: 1.1rem; color: #374151; margin-bottom: 16px; }
+  .info-row {
+    display: flex; justify-content: space-between; padding: 8px 0;
+    border-bottom: 1px solid #f0f0f0;
+  }
+  .info-row:last-child { border-bottom: none; }
+  .info-label { color: #6b7280; }
+  .info-value { font-weight: 500; color: #1a2332; }
+  .btn {
+    display: inline-block; padding: 10px 24px; border-radius: 8px;
+    text-decoration: none; font-weight: 500; transition: background 0.15s;
+    background: #165dcc; color: white; border: none; cursor: pointer;
+  }
+  .btn:hover { background: #1a4fa8; }
+  .btn-secondary {
+    background: #e5e7eb; color: #374151;
+  }
+  .btn-secondary:hover { background: #d1d5db; }
+  .actions { display: flex; gap: 12px; margin-top: 20px; }
+  footer {
+    text-align: center; padding: 24px; color: #9ca3af; font-size: 0.875rem;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Приложение InSales</h1>
+</header>
+<main>
+  <div class="card">
+    <h2>Магазин</h2>
+    <div class="info-row">
+      <span class="info-label">Название</span>
+      <span class="info-value">{{ title }}</span>
+    </div>
+    <div class="info-row">
+      <span class="info-label">Домен</span>
+      <span class="info-value">{{ shop }}</span>
+    </div>
+    <div class="info-row">
+      <span class="info-label">ID магазина</span>
+      <span class="info-value">{{ store_id }}</span>
+    </div>
+    <div class="actions">
+      <a href="/probe" class="btn">Проверить API</a>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Информация</h2>
+    <p>Установка подтверждена через API. Вход авторизован подписью token3.</p>
+    <p>Заготовка приложения InSales на Python (Flask).</p>
+  </div>
+</main>
+<footer>
+  InSales Partner App · Python / Flask
+</footer>
+</body>
+</html>
