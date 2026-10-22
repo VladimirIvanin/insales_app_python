@@ -42,7 +42,11 @@ class SubscriptionService:
         """Зарегистрировать стандартный набор подписок.
 
         Пропускает темы, для которых уже есть активная подписка
-        текущего поколения (устойчив к повторным вызовам).
+        текущего поколения **с подтверждённым insales_id** (устойчив
+        к повторным вызовам).
+
+        Подписка со state='active' и NULL insales_id считается
+        неподтверждённой — после сбоя API она будет повторно создана.
 
         1. Создать локальную подписку.
         2. Создать удалённую через API.
@@ -53,11 +57,12 @@ class SubscriptionService:
         """
         results: list[SubscriptionRow] = []
         for topic in self.DEFAULT_TOPICS:
-            # Пропускаем, если подписка уже существует
             existing = self._subs.get_by_store_and_topic(store_id, topic)
+            # Пропускаем только полностью завершённые подписки
             if existing is not None and existing['state'] == 'active':
                 if existing.get('generation', 0) == generation:
-                    continue
+                    if existing.get('insales_id') is not None:
+                        continue
 
             sub = self.register_topic(client, store_id, generation, topic)
             if sub:

@@ -62,8 +62,9 @@ class SessionMiddleware:
 def require_session(mw: SessionMiddleware):
     """Декоратор, требующий валидной сессии.
 
-    Проверяет сессию в SQLite по cookie и соответствие поколения.
-    При отсутствии или несоответствии возвращает 401.
+    Проверяет сессию в SQLite по cookie и соответствие поколения
+    в одном согласованном чтении. При отсутствии или несоответствии
+    возвращает 401.
     """
     def decorator(f):
         @wraps(f)
@@ -71,12 +72,16 @@ def require_session(mw: SessionMiddleware):
             session = mw.get_current_session()
             if session is None:
                 return '', 401
-            if not mw.validate_session_generation(session):
-                return '', 401
-            g.session = session
+            # Получаем store в одном чтении и проверяем generation
+            # на той же строке, из которой создаётся клиент.
+            # Это устраняет race: если между чтениями произошла
+            # переустановка, генерация не совпадёт.
             store = mw.store.get_store(session['store_id'])
             if store is None:
                 return '', 401
+            if store['generation'] != session.get('generation', 0):
+                return '', 401
+            g.session = session
             g.store = store
             g.client = mw.get_client(store['shop'], store['password'])
             return f(*args, **kwargs)

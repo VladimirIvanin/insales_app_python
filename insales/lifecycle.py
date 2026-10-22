@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 INSTALL_WORKERS = 2
 MAX_CANDIDATES_PER_SHOP = 5
+CANDIDATE_TTL = 600  # 10 минут — кандидаты дольше этого срока считаются устаревшими
 CHALLENGE_TTL = 300  # 5 минут
 SESSION_TTL = 3600  # 1 час
 
@@ -137,7 +138,8 @@ class Lifecycle:
         if shop not in self.allowed_shops:
             raise ValueError(f'Shop {shop} is not in ALLOWED_SHOPS')
 
-        # Throttling: ограничить число незавершённых candidates на магазин
+        # Throttling: очищаем устаревших кандидатов и проверяем лимит
+        self.store.delete_stale_installs(CANDIDATE_TTL)
         if len(self.store.list_installs_by_shop(shop)) >= MAX_CANDIDATES_PER_SHOP:
             raise ValueError(f'Too many pending installs for shop {shop}')
 
@@ -181,8 +183,14 @@ class Lifecycle:
                 store_id,
             )
 
-    def _verify_install_worker(self, candidate: str) -> None:
-        """Фоновая верификация кандидата установки."""
+    def _verify_install_worker(self, candidate: str,
+                                 attempt: int = 0) -> None:
+        """Фоновая верификация кандидата установки.
+
+        При временных ошибках повторяет попытку с экспоненциальной
+        задержкой (10 с, 30 с, 60 с). Если исчерпаны попытки или
+        истёк CANDIDATE_TTL — кандидат удаляется.
+        """
         install = self.store.get_install(candidate)
         if install is None:
             return
@@ -209,19 +217,33 @@ class Lifecycle:
 
         except ApiError as exc:
             if exc.is_temporary:
-                # Временная ошибка — оставляем кандидата для повтора при рестарте
+                self._retry_or_discard(candidate, attempt)
                 return
             self.store.delete_install(candidate)
             return
         except TransportError:
-            # Сетевая ошибка транспорта — временная, оставляем кандидата
+            self._retry_or_discard(candidate, attempt)
             return
         except (OSError, ValueError):
-            # Сетевой обрыв, невалидный JSON — временные, оставляем кандидата
+            self._retry_or_discard(candidate, attempt)
             return
         except Exception:
             self.store.delete_install(candidate)
             return
+
+    def _retry_or_discard(self, candidate: str, attempt: int) -> None:
+        """Повторить верификацию с задержкой или удалить кандидата."""
+        delays = [10, 30, 60]
+        if attempt >= len(delays):
+            self.store.delete_install(candidate)
+            return
+        delay = delays[attempt]
+        if CANDIDATE_TTL > 0:
+            # Удаляем устаревшие кандидаты перед повтором
+            self.store.delete_stale_installs(CANDIDATE_TTL)
+        import time
+        time.sleep(delay)
+        self._verify_install_worker(candidate, attempt + 1)
 
     # ---- Uninstall ----
 
@@ -233,40 +255,18 @@ class Lifecycle:
         ``MD5(install_token + app_secret)`` — тот же, что был сохранён
         при install. Повторное хэширование не требуется.
 
-        Валидирует shop/пароль, затем атомарно удаляет магазин,
-        сессии, challenge'и и кандидатов в одной write-транзакции.
-
-        Если магазин ещё не активирован (есть только pending install),
-        удаляет кандидата по паролю.
+        Использует атомарную операцию ``uninstall_store_or_pending_install``,
+        которая в одной write-транзакции проверяет и active store,
+        и pending install, исключая race condition с фоновой активацией.
 
         Возвращает True при успешном удалении, False если магазин не найден.
         """
         shop = validate_shop(shop)
 
-        # Сначала проверяем, может это ещё не активированный кандидат?
-        store_row = self.store.get_store_shop_and_password(insales_id)
-        if store_row is None:
-            # Магазина нет — возможно, есть только pending install?
-            # Ищем кандидата по store_id + shop + password
-            install = self.store.get_install_by_store_shop_and_password(
-                insales_id, shop, password,
-            )
-            if install is not None:
-                # Атомарно удаляем этот кандидат
-                return self.store.consume_install_by_store_password(
-                    insales_id, install['password']
-                )
-            return False
-
-        if store_row['shop'] != shop:
-            raise ValueError('Shop mismatch')
-
-        if not secure_compare(password, store_row['password']):
-            raise LifecycleError('Invalid uninstall token')
-
-        # Единая транзакция удаления с проверкой generation
-        return self.store.uninstall_store(insales_id,
-                                          store_row['generation'])
+        # Единая атомарная операция: active store ИЛИ pending install
+        return self.store.uninstall_store_or_pending_install(
+            insales_id, shop, password,
+        )
 
     # ---- Login / Autologin ----
 

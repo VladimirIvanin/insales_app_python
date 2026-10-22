@@ -122,9 +122,46 @@ def upgrade(db_path: Path) -> None:
 
 
 def status(db_path: Path) -> list[dict]:
-    """Показать статус миграций."""
+    """Показать статус миграций.
+
+    Если база данных не существует (файл или каталог отсутствует),
+    возвращает статус нулевой версии вместо ошибки соединения.
+    """
     db_path = Path(db_path).resolve()
-    conn = sqlite3.connect(str(db_path), timeout=5)
+    if not db_path.parent.exists():
+        # Родительский каталог не создан — база ещё не инициализирована
+        result = []
+        for version, desc, _ in MIGRATIONS:
+            result.append({
+                'version': version,
+                'description': desc,
+                'applied': False,
+            })
+        result.append({
+            'version': 'current',
+            'description': 'Текущая версия схемы',
+            'applied': 0,
+        })
+        return result
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5)
+    except sqlite3.OperationalError:
+        # База недоступна (например, отсутствует каталог)
+        result = []
+        for version, desc, _ in MIGRATIONS:
+            result.append({
+                'version': version,
+                'description': desc,
+                'applied': False,
+            })
+        result.append({
+            'version': 'current',
+            'description': 'Текущая версия схемы',
+            'applied': 0,
+        })
+        return result
+
     try:
         conn.execute('PRAGMA journal_mode=WAL')
         conn.executescript(SCHEMA_VERSION_TABLE)

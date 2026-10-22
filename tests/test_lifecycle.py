@@ -132,7 +132,8 @@ class TestInstall:
         assert store.get_install(candidate) is None
 
     def test_temporary_error_preserves_candidate(self, lifecycle, store):
-        """Временная ошибка (429) сохраняет кандидата для повтора."""
+        """Временная ошибка (429) не удаляет кандидата мгновенно,
+        а повторяет попытку. После исчерпания retry удаляет."""
         candidate = lifecycle.process_install(
             shop='shop.example',
             insales_id='42',
@@ -143,12 +144,16 @@ class TestInstall:
         mock_client.get_account.side_effect = ApiError(429)
 
         with patch.object(lifecycle, '_make_client', return_value=mock_client):
-            lifecycle._verify_install_worker(candidate)
+            with patch.object(lifecycle, '_retry_or_discard') as mock_retry:
+                lifecycle._verify_install_worker(candidate)
 
+        # Первый вызов не удаляет — передаёт в _retry_or_discard
+        mock_retry.assert_called_once_with(candidate, 0)
         assert store.get_install(candidate) is not None
 
     def test_network_error_preserves_candidate(self, lifecycle, store):
-        """Сетевой обрыв сохраняет кандидата для повтора при рестарте."""
+        """Сетевой обрыв не удаляет кандидата мгновенно,
+        а повторяет попытку. После исчерпания retry удаляет."""
         candidate = lifecycle.process_install(
             shop='shop.example',
             insales_id='42',
@@ -159,9 +164,29 @@ class TestInstall:
         mock_client.get_account.side_effect = OSError('Connection refused')
 
         with patch.object(lifecycle, '_make_client', return_value=mock_client):
-            lifecycle._verify_install_worker(candidate)
+            with patch.object(lifecycle, '_retry_or_discard') as mock_retry:
+                lifecycle._verify_install_worker(candidate)
 
+        # Первый вызов не удаляет — передаёт в _retry_or_discard
+        mock_retry.assert_called_once_with(candidate, 0)
         assert store.get_install(candidate) is not None
+
+    def test_temporary_error_eventually_removes_after_retries(self, lifecycle, store):
+        """Временная ошибка удаляет кандидата после исчерпания retry."""
+        candidate = lifecycle.process_install(
+            shop='shop.example',
+            insales_id='42',
+            token='install-token',
+        )
+
+        mock_client = MagicMock()
+        mock_client.get_account.side_effect = ApiError(429)
+
+        with patch.object(lifecycle, '_make_client', return_value=mock_client):
+            with patch('insales.lifecycle.time.sleep'):
+                lifecycle._verify_install_worker(candidate)
+
+        assert store.get_install(candidate) is None
 
     def test_activate_install_atomic(self, store):
         """activate_install атомарно проверяет и активирует."""
@@ -299,14 +324,14 @@ class TestUninstall:
         assert store.get_install('cand1') is None
 
     def test_uninstall_with_wrong_token(self, lifecycle, preinstalled_store):
-        """Неверный пароль вызывает ошибку, магазин сохраняется."""
+        """Неверный пароль — False, магазин сохраняется."""
         store, _, _ = preinstalled_store
-        with pytest.raises(LifecycleError, match='Invalid uninstall token'):
-            lifecycle.process_uninstall(
-                shop='shop.example',
-                insales_id='42',
-                password='0' * 32,
-            )
+        result = lifecycle.process_uninstall(
+            shop='shop.example',
+            insales_id='42',
+            password='0' * 32,
+        )
+        assert result is False
         assert store.get_store('42') is not None
 
     def test_uninstall_nonexistent_store(self, lifecycle):
@@ -356,7 +381,7 @@ class TestUninstall:
 
     def test_uninstall_new_install_not_affected(self, lifecycle, store,
                                                  preinstalled_store):
-        """Старый uninstall не удаляет новую установку (через generation)."""
+        """Старый uninstall не удаляет новую установку (через смену пароля)."""
         store, _, old_good_password = preinstalled_store
 
         # Получаем generation магазина
@@ -376,14 +401,13 @@ class TestUninstall:
         with patch.object(lifecycle, '_make_client', return_value=mock_client):
             lifecycle._verify_install_worker(candidate)
 
-        # Теперь пробуем uninstall со СТАРЫМ паролем (должен не совпасть,
-        # т.к. пароль изменился при переустановке)
-        with pytest.raises(LifecycleError, match='Invalid uninstall token'):
-            lifecycle.process_uninstall(
-                shop='shop.example',
-                insales_id='42',
-                password=old_good_password,
-            )
+        # Старый пароль больше не подходит — False
+        result = lifecycle.process_uninstall(
+            shop='shop.example',
+            insales_id='42',
+            password=old_good_password,
+        )
+        assert result is False
         # Новая установка жива
         assert store.get_store('42') is not None
         assert store.get_store('42')['generation'] > old_generation

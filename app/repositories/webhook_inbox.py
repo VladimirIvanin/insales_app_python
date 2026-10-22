@@ -69,6 +69,10 @@ class WebhookInbox:
                 lock_ttl: int = 300) -> bool:
         """Атомарно захватить событие для обработки.
 
+        Проверяет не только state/lock, но и next_attempt_at,
+        чтобы воркер со старой выборкой не захватил событие,
+        которое должно ждать повтора.
+
         Args:
             inbox_id: ID события.
             worker_id: Идентификатор worker'а.
@@ -83,8 +87,9 @@ class WebhookInbox:
                 '''UPDATE webhook_inbox
                    SET locked_at=?, locked_by=?, updated_at=julianday("now")
                    WHERE id=? AND state='pending'
+                     AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
                      AND (locked_at IS NULL OR locked_at < ?)''',
-                (now, worker_id, inbox_id, now - lock_ttl),
+                (now, worker_id, inbox_id, now, now - lock_ttl),
             )
             return cur.rowcount > 0
 

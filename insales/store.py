@@ -231,6 +231,22 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def delete_stale_installs(self, max_age_seconds: int) -> int:
+        """Удалить кандидатов старше max_age_seconds.
+
+        Возвращает количество удалённых записей.
+        """
+        cutoff = time.time() - max_age_seconds
+        # julianday('now') — дни от юлианской эпохи
+        # Переводим cutoff в юлианские дни
+        jd_cutoff = cutoff / 86400.0 + 2440587.5
+        with self._connect() as conn:
+            cur = conn.execute(
+                'DELETE FROM installs WHERE created_at < ?',
+                (jd_cutoff,),
+            )
+            return cur.rowcount
+
     def activate_install(self, candidate: str, title: str) -> bool:
         """Атомарная активация: проверяет, что кандидат — актуального поколения.
 
@@ -292,18 +308,17 @@ class Store:
         """Атомарное удаление кандидата по store_id+password для uninstall.
 
         Используется когда установка ещё не активирована, но пришёл uninstall.
+        Удаляет только те кандидаты, у которых пароль совпадает (в WHERE,
+        а не только в пост-проверке), что исключает удаление всех кандидатов
+        при нескольких установках одного магазина.
         """
         with self._connect() as conn:
             conn.execute('BEGIN IMMEDIATE')
-            install = conn.execute(
-                'SELECT * FROM installs WHERE store_id=?', (store_id,)
-            ).fetchone()
-            if install is None:
-                return False
-            if install['password'] != password:
-                return False
-            conn.execute('DELETE FROM installs WHERE store_id=?', (store_id,))
-            return True
+            cur = conn.execute(
+                'DELETE FROM installs WHERE store_id=? AND password=?',
+                (store_id, password),
+            )
+            return cur.rowcount > 0
 
     # --- Единая операция uninstall ---
 
@@ -333,6 +348,58 @@ class Store:
             conn.execute('DELETE FROM installs WHERE store_id=?', (store_id,))
             conn.execute('DELETE FROM stores WHERE id=?', (store_id,))
             return True
+
+    def uninstall_store_or_pending_install(
+        self, store_id: str, shop: str, password: str
+    ) -> bool:
+        """Атомарная отмена: удалить active store ИЛИ pending install.
+
+        В одной write-транзакции:
+        1. Пытается найти active store по store_id с проверкой пароля.
+           Если найден — удаляет store, sessions, challenges, installs.
+        2. Если active store не найден — ищет pending install по
+           store_id + shop + password и удаляет только его.
+
+        Это устраняет race condition, когда между раздельными чтениями
+        store и install другой worker успевает активировать кандидата.
+
+        Возвращает True при успешном удалении.
+        """
+        with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+
+            # Шаг 1: проверяем active store
+            store_row = conn.execute(
+                'SELECT id, shop, password, generation FROM stores WHERE id=?',
+                (store_id,),
+            ).fetchone()
+            if store_row is not None:
+                if store_row['shop'] != shop:
+                    return False
+                from insales.crypto import secure_compare
+                if not secure_compare(password, store_row['password']):
+                    return False
+                # Active store найден — удаляем всё
+                conn.execute('DELETE FROM sessions WHERE store_id=?', (store_id,))
+                conn.execute('DELETE FROM challenges WHERE store_id=?', (store_id,))
+                conn.execute('DELETE FROM installs WHERE store_id=?', (store_id,))
+                conn.execute('DELETE FROM stores WHERE id=?', (store_id,))
+                return True
+
+            # Шаг 2: active store нет — ищем pending install
+            install = conn.execute(
+                'SELECT * FROM installs WHERE store_id=? AND shop=? AND password=?'
+                ' ORDER BY generation DESC LIMIT 1',
+                (store_id, shop, password),
+            ).fetchone()
+            if install is not None:
+                conn.execute(
+                    'DELETE FROM installs WHERE candidate=?',
+                    (install['candidate'],),
+                )
+                return True
+
+            return False
 
     # --- Challenges ---
 
