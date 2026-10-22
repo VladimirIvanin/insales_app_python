@@ -1,4 +1,6 @@
 """Фикстуры для тестов Lifecycle."""
+from __future__ import annotations
+
 import json
 import tempfile
 from pathlib import Path
@@ -24,22 +26,42 @@ def tmp_db_path():
 @pytest.fixture
 def store(tmp_db_path):
     """SQLite Store на временной БД."""
-    return Store(tmp_db_path)
+    s = Store(tmp_db_path)
+    yield s
 
 
 @pytest.fixture
 def lifecycle(store):
-    """Lifecycle с тестовыми credentials."""
-    return Lifecycle(
+    """Lifecycle с тестовыми credentials, worker'ы НЕ запущены."""
+    lc = Lifecycle(
         store=store,
         app_id='test-app',
         app_secret='test-secret-key',
         dev=True,
+        allowed_shops={'shop.example', 'another.shop'},
     )
+    # Не вызываем lc.start() — тесты делают это явно или работают без workers
+    yield lc
+    lc.shutdown()
 
 
 @pytest.fixture
-def preinstalled_store(store):
+def lifecycle_with_workers(store):
+    """Lifecycle с запущенными worker'ами."""
+    lc = Lifecycle(
+        store=store,
+        app_id='test-app',
+        app_secret='test-secret-key',
+        dev=True,
+        allowed_shops={'shop.example', 'another.shop'},
+    )
+    lc.start()
+    yield lc
+    lc.shutdown()
+
+
+@pytest.fixture
+def preinstalled_store(store, lifecycle):
     """Предустановленный магазин в БД."""
     good_password = store_password(
         VECTORS['install']['install_token'],

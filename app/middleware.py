@@ -2,7 +2,12 @@
 
 Проверяет собственную сессию пользователя, извлекает store_id
 и предоставляет InSalesClient для авторизованного запроса.
+
+Сессия привязана к поколению (generation) магазина; если после
+создания сессии произошла переустановка — сессия считается недействительной.
 """
+from __future__ import annotations
+
 from functools import wraps
 
 from flask import g, request
@@ -33,6 +38,17 @@ class SessionMiddleware:
             return None
         return self.store.get_session(sid)
 
+    def validate_session_generation(self, session: dict) -> bool:
+        """Проверить, что поколение сессии соответствует текущему магазину.
+
+        Если после создания сессии установка была заменена (новое поколение),
+        сессия недействительна.
+        """
+        store = self.store.get_store(session['store_id'])
+        if store is None:
+            return False
+        return store['generation'] == session.get('generation', 0)
+
     def get_client(self, shop: str, password: str) -> InSalesClient:
         """Создать авторизованный API-клиент для магазина."""
         return InSalesClient(
@@ -46,14 +62,16 @@ class SessionMiddleware:
 def require_session(mw: SessionMiddleware):
     """Декоратор, требующий валидной сессии.
 
-    Проверяет сессию в SQLite по cookie.
-    При отсутствии возвращает 401.
+    Проверяет сессию в SQLite по cookie и соответствие поколения.
+    При отсутствии или несоответствии возвращает 401.
     """
     def decorator(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
             session = mw.get_current_session()
             if session is None:
+                return '', 401
+            if not mw.validate_session_generation(session):
                 return '', 401
             g.session = session
             store = mw.store.get_store(session['store_id'])

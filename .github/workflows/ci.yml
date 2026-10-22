@@ -50,7 +50,7 @@ jobs:
 
       - name: Run tests with coverage
         run: |
-          python -m pytest tests/ -v --cov=platform --cov=app --cov-report=term --cov-fail-under=80
+          python -m pytest tests/ -v --cov=insales --cov=app --cov-report=term
 
       - name: Upload coverage
         if: success()

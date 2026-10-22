@@ -1,19 +1,23 @@
 """Хранилище данных приложения InSales (SQLite).
 
 Таблицы:
-- stores: установленные магазины (credentials, title)
+- stores: установленные магазины (credentials, title, generation)
 - installs: кандидаты установки (ожидают фоновой проверки)
 - challenges: одноразовые nonce для autologin
-- sessions: пользовательские сессии
+- sessions: пользовательские сессии (привязаны к generation)
 
 Credentials в SQLite не зашифрованы.
 Для production требуется encryption at rest.
 """
+from __future__ import annotations
+
 import sqlite3
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
+
+# Импорт app.db.connection выполняется внутри методов для избежания цикла
 
 StoreRow = dict
 SessionRow = dict
@@ -26,71 +30,62 @@ class StoreError(Exception):
 class Store:
     """Хранилище данных приложения на SQLite."""
 
-    SCHEMA = '''
-        CREATE TABLE IF NOT EXISTS stores (
-            id           TEXT PRIMARY KEY,
-            shop         TEXT UNIQUE NOT NULL,
-            password     TEXT NOT NULL,
-            title        TEXT DEFAULT '',
-            created_at   REAL NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS installs (
-            candidate    TEXT PRIMARY KEY,
-            store_id     TEXT NOT NULL,
-            shop         TEXT NOT NULL,
-            password     TEXT NOT NULL,
-            created_at   REAL NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS challenges (
-            sid          TEXT PRIMARY KEY,
-            store_id     TEXT NOT NULL,
-            nonce        TEXT NOT NULL,
-            expires      REAL NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sessions (
-            sid          TEXT PRIMARY KEY,
-            store_id     TEXT NOT NULL,
-            user_id      TEXT NOT NULL,
-            expires      REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_stores_shop ON stores(shop);
-        CREATE INDEX IF NOT EXISTS idx_installs_store ON installs(store_id);
-        CREATE INDEX IF NOT EXISTS idx_challenges_store ON challenges(store_id);
-        CREATE INDEX IF NOT EXISTS idx_sessions_store ON sessions(store_id);
-    '''
-
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path).resolve()
         self.db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with self._connect() as conn:
-            conn.executescript(self.SCHEMA)
-        self.db_path.chmod(0o600)
+        # upgrade схемы применяется через _connect() → app/db/connection
+        # chmod выполняется при первом _connect (файл уже существует)
+        self._chmod_done = False
 
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
-        conn = sqlite3.connect(self.db_path, timeout=5)
-        conn.row_factory = sqlite3.Row
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA foreign_keys=ON')
-        try:
-            with conn:
-                yield conn
-        finally:
-            conn.close()
+        from app.db.connection import connect as _db_connect
+        with _db_connect(self.db_path) as conn:
+            if not self._chmod_done:
+                if self.db_path.exists():
+                    self.db_path.chmod(0o600)
+                self._chmod_done = True
+            yield conn
+
+    # --- Поколение ---
+
+    def next_generation(self, conn: sqlite3.Connection | None = None) -> int:
+        """Монотонно возрастающий номер поколения на основе времени.
+
+        Использует int(time.time() * 1000) как стартовую точку.
+        Если часы переведены назад — гарантирует рост через MAX.
+        """
+        now_ms = int(time.time() * 1000)
+        if conn is None:
+            with self._connect() as conn2:
+                return self._ensure_monotonic(conn2, now_ms)
+        return self._ensure_monotonic(conn, now_ms)
+
+    @staticmethod
+    def _ensure_monotonic(conn: sqlite3.Connection, now_ms: int) -> int:
+        last = conn.execute(
+            'SELECT COALESCE(MAX(generation), 0) FROM stores'
+        ).fetchone()[0]
+        last_install = conn.execute(
+            'SELECT COALESCE(MAX(generation), 0) FROM installs'
+        ).fetchone()[0]
+        return max(now_ms, last + 1, last_install + 1)
 
     # --- Stores ---
 
     def add_store(self, store_id: str, shop: str,
-                  password: str, title: str = '') -> None:
+                  password: str, title: str = '',
+                  generation: int = 0) -> None:
         with self._connect() as conn:
             conn.execute(
-                '''INSERT INTO stores (id, shop, password, title)
-                   VALUES (?, ?, ?, ?)
+                '''INSERT INTO stores (id, shop, password, title, generation)
+                   VALUES (?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        shop=excluded.shop,
                        password=excluded.password,
-                       title=excluded.title''',
-                (store_id, shop, password, title),
+                       title=excluded.title,
+                       generation=excluded.generation''',
+                (store_id, shop, password, title, generation),
             )
 
     def get_store(self, store_id: str) -> StoreRow | None:
@@ -104,6 +99,15 @@ class Store:
         with self._connect() as conn:
             row = conn.execute(
                 'SELECT * FROM stores WHERE shop=?', (shop,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_store_shop_and_password(self, store_id: str) -> StoreRow | None:
+        """Получить shop и password для store_id (для uninstall auth)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                'SELECT id, shop, password, generation FROM stores WHERE id=?',
+                (store_id,),
             ).fetchone()
         return dict(row) if row else None
 
@@ -122,17 +126,27 @@ class Store:
     # --- Installs (candidates) ---
 
     def add_install(self, candidate: str, store_id: str,
-                    shop: str, password: str) -> None:
+                    shop: str, password: str, generation: int = 0) -> None:
         with self._connect() as conn:
             conn.execute(
-                'INSERT INTO installs VALUES (?, ?, ?, ?, julianday("now"))',
-                (candidate, store_id, shop, password),
+                '''INSERT OR REPLACE INTO installs
+                   (candidate, store_id, shop, password, generation, created_at)
+                   VALUES (?, ?, ?, ?, ?, julianday("now"))''',
+                (candidate, store_id, shop, password, generation),
             )
 
     def get_install(self, candidate: str) -> StoreRow | None:
         with self._connect() as conn:
             row = conn.execute(
                 'SELECT * FROM installs WHERE candidate=?', (candidate,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_install_by_store_id(self, store_id: str) -> StoreRow | None:
+        """Получить установку по store_id (для uninstall до активации)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                'SELECT * FROM installs WHERE store_id=?', (store_id,)
             ).fetchone()
         return dict(row) if row else None
 
@@ -143,12 +157,123 @@ class Store:
             )
             return cur.rowcount > 0
 
+    def delete_installs_by_store(self, store_id: str) -> int:
+        """Удалить все кандидаты для магазина. Возвращает количество."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                'DELETE FROM installs WHERE store_id=?', (store_id,)
+            )
+            return cur.rowcount
+
     def list_installs(self) -> list[StoreRow]:
         with self._connect() as conn:
             rows = conn.execute(
                 'SELECT * FROM installs ORDER BY created_at DESC'
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def activate_install(self, candidate: str, title: str) -> bool:
+        """Атомарная активация: проверяет, что кандидат — актуального поколения.
+
+        В одной транзакции:
+        1. Читает кандидата
+        2. Проверяет, что generation кандидата >= текущего generation магазина
+           (предотвращает активацию устаревшего кандидата)
+        3. Удаляет старые сессии/challenge
+        4. Заменяет/создаёт запись магазина
+        5. Удаляет кандидата
+
+        Возвращает True при успешной активации, False если кандидат
+        был удалён или устарел (гонка с uninstall или повторной установкой).
+        """
+        with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            install = conn.execute(
+                'SELECT * FROM installs WHERE candidate=?', (candidate,)
+            ).fetchone()
+            if install is None:
+                return False
+
+            install_gen = install['generation']
+
+            # Проверить, что generation кандидата не меньше текущего магазина
+            store_row = conn.execute(
+                'SELECT generation FROM stores WHERE id=?',
+                (install['store_id'],),
+            ).fetchone()
+            if store_row is not None and install_gen < store_row['generation']:
+                # Устаревший кандидат — удаляем, не активируем
+                conn.execute('DELETE FROM installs WHERE candidate=?',
+                             (candidate,))
+                return False
+
+            # Удалить старые сессии/challenge
+            conn.execute('DELETE FROM sessions WHERE store_id=?',
+                         (install['store_id'],))
+            conn.execute('DELETE FROM challenges WHERE store_id=?',
+                         (install['store_id'],))
+            conn.execute(
+                '''INSERT INTO stores (id, shop, password, title, generation)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       shop=excluded.shop,
+                       password=excluded.password,
+                       title=excluded.title,
+                       generation=excluded.generation''',
+                (install['store_id'], install['shop'], install['password'],
+                 title, install_gen),
+            )
+            conn.execute('DELETE FROM installs WHERE candidate=?',
+                         (candidate,))
+            return True
+
+    def consume_install_by_store_password(
+        self, store_id: str, password: str
+    ) -> bool:
+        """Атомарное удаление кандидата по store_id+password для uninstall.
+
+        Используется когда установка ещё не активирована, но пришёл uninstall.
+        """
+        with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            install = conn.execute(
+                'SELECT * FROM installs WHERE store_id=?', (store_id,)
+            ).fetchone()
+            if install is None:
+                return False
+            if install['password'] != password:
+                return False
+            conn.execute('DELETE FROM installs WHERE store_id=?', (store_id,))
+            return True
+
+    # --- Единая операция uninstall ---
+
+    def uninstall_store(self, store_id: str,
+                        expected_generation: int) -> bool:
+        """Атомарное удаление магазина и всех связанных данных.
+
+        Удаляет store, sessions, challenges, installs для данного store_id
+        в одной write-транзакции, но только если generation совпадает
+        (защита от race condition при переустановке).
+
+        Возвращает True, если магазин был удалён.
+        """
+        with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute(
+                'SELECT generation FROM stores WHERE id=?', (store_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if row['generation'] != expected_generation:
+                # Магазин уже переустановлен с новым generation
+                return False
+
+            conn.execute('DELETE FROM sessions WHERE store_id=?', (store_id,))
+            conn.execute('DELETE FROM challenges WHERE store_id=?', (store_id,))
+            conn.execute('DELETE FROM installs WHERE store_id=?', (store_id,))
+            conn.execute('DELETE FROM stores WHERE id=?', (store_id,))
+            return True
 
     # --- Challenges ---
 
@@ -180,13 +305,15 @@ class Store:
     # --- Sessions ---
 
     def add_session(self, sid: str, store_id: str,
-                    user_id: str, ttl: int = 3600) -> None:
+                    user_id: str, ttl: int = 3600,
+                    generation: int = 0) -> None:
         expires = time.time() + ttl
         with self._connect() as conn:
             self._cleanup_expired(conn)
             conn.execute(
-                'INSERT INTO sessions VALUES (?, ?, ?, ?)',
-                (sid, store_id, user_id, expires),
+                'INSERT INTO sessions (sid, store_id, user_id, expires, generation) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (sid, store_id, user_id, expires, generation),
             )
 
     def get_session(self, sid: str) -> SessionRow | None:

@@ -4,8 +4,11 @@
 ограничение размера ответа, таймауты, отказ от следования редиректам
 и заголовки лимитов API.
 
-Основание: generated-api спецификации InSales, контракты из lifecycle.md.
+Допустимые успешные статусы: 200, 201.
+Пустой ответ (202, 204, пустое тело 200) возвращает None.
 """
+from __future__ import annotations
+
 import base64
 import http.client
 import json
@@ -14,6 +17,9 @@ from typing import Any
 
 MAX_RESPONSE_BYTES = 2_000_000
 REQUEST_TIMEOUT = 10
+_OK_STATUSES = {200, 201}
+
+_LOOPBACK_HOSTS = frozenset({'127.0.0.1', '::1', 'localhost'})
 
 
 class ApiError(Exception):
@@ -35,13 +41,29 @@ class ApiError(Exception):
             parts.append(f'retry_after={self.retry_after}')
         return ' | '.join(parts)
 
+    @property
+    def is_temporary(self) -> bool:
+        """429, 5xx и сетевые обрывы — временные ошибки."""
+        return self.status in (429,) or self.status >= 500
+
 
 def validate_shop(shop: str) -> str:
     """Валидация домена магазина (базовая проверка формата)."""
     shop = shop.lower().strip()
-    if not re.fullmatch(r'[a-z0-9][a-z0-9.\-]*(?::\d{1,5})?', shop):
+    m = re.fullmatch(r'([a-z0-9][a-z0-9.\-]*)(?::(\d{1,5}))?', shop)
+    if not m:
         raise ValueError(f'Invalid shop domain format: {shop}')
     return shop
+
+
+def _parse_shop(shop: str) -> tuple[str, int | None]:
+    """Разобрать shop на host и опциональный port."""
+    m = re.fullmatch(r'([a-z0-9][a-z0-9.\-]*)(?::(\d{1,5}))?', shop.lower().strip())
+    if not m:
+        raise ValueError(f'Invalid shop domain format: {shop}')
+    host = m.group(1)
+    port = int(m.group(2)) if m.group(2) else None
+    return host, port
 
 
 class InSalesClient:
@@ -49,7 +71,9 @@ class InSalesClient:
 
     def __init__(self, shop: str, app_id: str, password: str,
                  dev: bool = False):
-        self.shop = validate_shop(shop)
+        host, port = _parse_shop(shop)
+        self.shop = host
+        self.port = port
         self.app_id = app_id
         self.password = password
         self._basic = base64.b64encode(
@@ -58,9 +82,13 @@ class InSalesClient:
         self._dev = dev
 
     def _connect(self) -> http.client.HTTPConnection:
-        if self._dev:
-            return http.client.HTTPConnection(self.shop, timeout=REQUEST_TIMEOUT)
-        return http.client.HTTPSConnection(self.shop, timeout=REQUEST_TIMEOUT)
+        kwargs = {'timeout': REQUEST_TIMEOUT}
+        if self.port:
+            kwargs['port'] = self.port
+        if self._dev and self.shop in _LOOPBACK_HOSTS:
+            # HTTP только для loopback-хостов в dev-режиме
+            return http.client.HTTPConnection(self.shop, **kwargs)
+        return http.client.HTTPSConnection(self.shop, **kwargs)
 
     def _request(self, method: str, path: str,
                  body: bytes | None = None,
@@ -83,13 +111,16 @@ class InSalesClient:
             usage = response.getheader('API-Usage-Limit')
             retry_after = response.getheader('Retry-After')
 
-            if response.status != 200:
+            if response.status not in _OK_STATUSES:
                 raise ApiError(
                     status=response.status,
                     body=raw.decode('utf-8', errors='replace'),
                     usage=usage,
                     retry_after=retry_after,
                 )
+
+            if not raw.strip():
+                return None, usage
 
             return json.loads(raw), usage
         finally:
@@ -116,8 +147,13 @@ class InSalesClient:
         return self._request('DELETE', path)
 
     def get_account(self) -> tuple[dict, str | None]:
-        """Получить информацию о магазине (/admin/account.json)."""
+        """Получить информацию о магазине (/admin/account.json).
+
+        Возвращает account-словарь. Гарантирует, что это dict, а не list.
+        """
         result, usage = self.get('/admin/account.json')
+        if not isinstance(result, dict):
+            raise ValueError(f'Expected account object, got {type(result).__name__}')
         return result, usage
 
     def verify_identity(self, expected_store_id: str) -> bool:
@@ -125,5 +161,5 @@ class InSalesClient:
         try:
             account, _ = self.get_account()
             return str(account.get('id')) == str(expected_store_id)
-        except (ApiError, OSError, ValueError):
+        except (ApiError, OSError, ValueError, TypeError):
             return False

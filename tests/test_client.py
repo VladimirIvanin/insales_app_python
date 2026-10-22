@@ -1,4 +1,5 @@
 """Тесты HTTP-клиента InSales API."""
+import http.client
 import json
 from unittest.mock import MagicMock, patch
 
@@ -29,6 +30,15 @@ class TestInSalesClient:
     def client(self):
         return InSalesClient(
             shop='shop.example',
+            app_id='test-app',
+            password='test-password',
+            dev=True,
+        )
+
+    @pytest.fixture
+    def client_loopback(self):
+        return InSalesClient(
+            shop='127.0.0.1',
             app_id='test-app',
             password='test-password',
             dev=True,
@@ -82,3 +92,15 @@ class TestInSalesClient:
         conn.getresponse.side_effect = OSError('Connection failed')
         with patch.object(client, '_connect', return_value=conn):
             assert client.verify_identity('42') is False
+
+    def test_dev_mode_http_only_for_loopback(self):
+        """dev=True: HTTP только для loopback, для других хостов — HTTPS."""
+        loopback_client = InSalesClient('127.0.0.1', 'app', 'pwd', dev=True)
+        conn = loopback_client._connect()
+        assert isinstance(conn, http.client.HTTPConnection)
+
+        external_client = InSalesClient(
+            'shop.example', 'app', 'pwd', dev=True,
+        )
+        conn2 = external_client._connect()
+        assert isinstance(conn2, http.client.HTTPSConnection)

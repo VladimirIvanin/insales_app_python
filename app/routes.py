@@ -8,7 +8,6 @@ Endpoints:
 - GET  /uninstall       — uninstall callback от InSales
 - GET  /                — dashboard (требует сессии)
 - GET  /probe           — API probe (требует сессии)
-- POST /webhook/insales — приём вебхуков (задел)
 """
 import json
 from urllib.parse import quote, urlencode
@@ -16,17 +15,36 @@ from urllib.parse import quote, urlencode
 from flask import Blueprint, g, make_response, redirect, render_template, request
 
 from app.middleware import SessionMiddleware, require_session
-from insales.lifecycle import Lifecycle
+from insales.lifecycle import Lifecycle, LifecycleError
 from insales.store import Store
 
-routes = Blueprint('app', __name__)
+
+def _is_loopback(host: str) -> bool:
+    """Проверить, что хост — loopback (для HTTP в dev)."""
+    return host in ('127.0.0.1', '::1', 'localhost')
+
+
+def _scheme(base_url: str) -> str:
+    """Определить схему: https если base_url начинается с https, иначе http."""
+    return 'https' if base_url.startswith('https://') else 'http'
+
+
+def _login_scheme(base_url: str, dev: bool, shop: str) -> str:
+    """Выбрать схему для редиректа входа.
+
+    HTTPS для всех, кроме loopback в dev-режиме.
+    """
+    if dev and _is_loopback(shop.split(':')[0]):
+        return 'http'
+    return 'https'
 
 
 def create_routes(store: Store, lifecycle: Lifecycle,
                   mw: SessionMiddleware, base_url: str):
     """Создать Blueprint с настроенными зависимостями."""
 
-    blueprint = Blueprint('app', __name__)
+    blueprint = Blueprint('app', __name__,
+                          template_folder='templates')
 
     @blueprint.route('/health')
     def health():
@@ -49,7 +67,7 @@ def create_routes(store: Store, lifecycle: Lifecycle,
     def login():
         """Начало login flow: создаёт challenge и redirect в InSales."""
         try:
-            shop = request.args.get('shop', '')
+            shop = request.args.get('shop', '').lower().strip()
             insales_id = request.args.get('insales_id', '')
 
             store_row = store.get_store(insales_id)
@@ -61,15 +79,18 @@ def create_routes(store: Store, lifecycle: Lifecycle,
                 'token': nonce,
                 'login': base_url.rstrip('/') + '/autologin',
             })
+            scheme = _login_scheme(base_url, lifecycle.dev, shop)
             login_url = (
-                f"http://{shop}/admin/applications/"
+                f"{scheme}://{shop}/admin/applications/"
                 f"{quote(lifecycle.app_id, safe='')}"
                 f"/login?{query}"
             )
             response = make_response(redirect(login_url, 302))
+            secure = _scheme(base_url) == 'https'
             response.set_cookie(
                 'challenge_sid', challenge_sid,
                 httponly=True, samesite='Lax',
+                secure=secure,
                 max_age=300, path='/',
             )
             return response
@@ -88,10 +109,12 @@ def create_routes(store: Store, lifecycle: Lifecycle,
         if session_id is None:
             return 'Login failed', 401
 
+        secure = _scheme(base_url) == 'https'
         response = make_response(redirect('/', 302))
         response.set_cookie(
             'app_session', session_id,
             httponly=True, samesite='Lax',
+            secure=secure,
             max_age=3600, path='/',
         )
         response.delete_cookie('challenge_sid', path='/')
@@ -105,11 +128,13 @@ def create_routes(store: Store, lifecycle: Lifecycle,
             insales_id = request.args.get('insales_id', '')
             token = request.args.get('token', '')
 
-            lifecycle.process_uninstall(shop, insales_id, token)
-            return 'Uninstalled', 200
+            ok = lifecycle.process_uninstall(shop, insales_id, token)
+            if ok:
+                return 'Uninstalled', 200
+            return 'Store not found', 404
         except (ValueError, KeyError):
             return 'Invalid request', 400
-        except Exception:
+        except LifecycleError:
             return 'Uninstall error', 401
 
     @blueprint.route('/')
@@ -142,25 +167,5 @@ def create_routes(store: Store, lifecycle: Lifecycle,
             )
         except Exception as e:
             return f'API error: {e}', 502
-
-    @blueprint.route('/webhook/insales', methods=['POST'])
-    def webhook():
-        """Приём вебхуков от InSales (задел для будущей реализации).
-
-        В production требуется:
-        - определение магазина по подписке
-        - проверка подписи вебхука (если предусмотрена InSales)
-        - сохранение в inbox для асинхронной обработки
-        """
-        topic = request.headers.get('X-InSales-Topic', 'unknown')
-        store_domain = request.headers.get('X-InSales-Store', 'unknown')
-        body = request.get_data(as_text=True)
-
-        # Логирование факта получения (без содержимого credentials)
-        print(f'Webhook: topic={topic} store={store_domain} size={len(body)}',
-              flush=True)
-
-        # В демо-режиме просто подтверждаем получение
-        return 'Webhook received', 200
 
     return blueprint
