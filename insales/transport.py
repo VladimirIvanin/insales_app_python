@@ -11,7 +11,7 @@ import json
 import re
 from typing import Any
 
-from insales.errors import ApiError, ResponseTooLargeError, TransportError
+from insales.errors import ApiError, ResourceError, ResponseTooLargeError, TransportError
 from insales.response import ApiResponse
 
 MAX_RESPONSE_BYTES = 2_000_000
@@ -20,19 +20,44 @@ _OK_STATUSES = {200, 201, 202, 204}
 
 _LOOPBACK_HOSTS = frozenset({'127.0.0.1', '::1', 'localhost'})
 
+_IPV6_PATTERN = re.compile(
+    r'^\[([a-fA-F0-9:]+)\](?::(\d{1,5}))?$',
+)
+_HOST_PATTERN = re.compile(
+    r'^([a-z0-9][a-z0-9.\-]*)(?::(\d{1,5}))?$',
+)
+
 
 def validate_shop(shop: str) -> str:
-    """Валидация домена магазина (базовая проверка формата)."""
+    """Валидация домена магазина (базовая проверка формата).
+
+    Поддерживает:
+    - Обычные домены: my-shop.myinsales.ru
+    - IPv4: 127.0.0.1, 127.0.0.1:8765
+    - IPv6: ::1, [::1]:8765
+    """
     shop = shop.lower().strip()
-    m = re.fullmatch(r'([a-z0-9][a-z0-9.\-]*)(?::(\d{1,5}))?', shop)
+    m = _IPV6_PATTERN.match(shop) or _HOST_PATTERN.match(shop)
     if not m:
         raise ValueError(f'Invalid shop domain format: {shop}')
     return shop
 
 
 def _parse_shop(shop: str) -> tuple[str, int | None]:
-    """Разобрать shop на host и опциональный port."""
-    m = re.fullmatch(r'([a-z0-9][a-z0-9.\-]*)(?::(\d{1,5}))?', shop.lower().strip())
+    """Разобрать shop на host и опциональный port.
+
+    Поддерживает:
+    - Обычные домены: my-shop.myinsales.ru
+    - IPv4: 127.0.0.1, 127.0.0.1:8765
+    - IPv6: ::1, [::1]:8765
+    """
+    raw = shop.lower().strip()
+    m = _IPV6_PATTERN.match(raw)
+    if m:
+        host = m.group(1)
+        port = int(m.group(2)) if m.group(2) else None
+        return host, port
+    m = _HOST_PATTERN.match(raw)
     if not m:
         raise ValueError(f'Invalid shop domain format: {shop}')
     host = m.group(1)
@@ -122,7 +147,12 @@ class Transport:
             if not raw.strip():
                 data = None
             else:
-                data = json.loads(raw)
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise ResourceError(
+                        f'Failed to decode JSON response: {exc}',
+                    ) from exc
 
             return ApiResponse(
                 data=data,

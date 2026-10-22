@@ -49,6 +49,7 @@ class WebhookSubscriptions:
                        address=excluded.address,
                        format_type=excluded.format_type,
                        state='active',
+                       insales_id=NULL,
                        updated_at=julianday('now')
                    WHERE generation <= excluded.generation''',
                 (store_id, generation, topic, secret,

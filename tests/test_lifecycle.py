@@ -26,7 +26,7 @@ from app.middleware import SessionMiddleware
 from app.routes import create_routes
 from insales.client import ApiError
 from insales.crypto import sign_token3
-from insales.lifecycle import Lifecycle, LifecycleError
+from insales.lifecycle import Lifecycle
 
 VECTORS = json.loads(
     Path(__file__).with_name('protocol-vectors.json').read_text()

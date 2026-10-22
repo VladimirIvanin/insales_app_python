@@ -144,6 +144,12 @@ class Store:
         Выполняется в одной write-транзакции (BEGIN IMMEDIATE),
         что исключает race condition при конкурентных установках.
 
+        Перед вставкой удаляет все существующие pending-кандидаты
+        с тем же store_id+shop+password. Это исключает ситуацию,
+        когда при повторном install callback выживает старший
+        кандидат после uninstall (см. P2). Кандидаты с другими
+        credentials (другой пароль/другой магазин) не затрагиваются.
+
         Returns:
             Зарезервированное значение generation.
         """
@@ -157,6 +163,11 @@ class Store:
                 'SELECT COALESCE(MAX(generation), 0) FROM installs'
             ).fetchone()[0]
             generation = max(now_ms, last + 1, last_install + 1)
+            # Удаляем существующие pending с matching credentials
+            conn.execute(
+                'DELETE FROM installs WHERE store_id=? AND shop=? AND password=?',
+                (store_id, shop, password),
+            )
             conn.execute(
                 '''INSERT OR REPLACE INTO installs
                    (candidate, store_id, shop, password, generation, created_at)
@@ -355,13 +366,19 @@ class Store:
         """Атомарная отмена: удалить active store ИЛИ pending install.
 
         В одной write-транзакции:
-        1. Пытается найти active store по store_id с проверкой пароля.
-           Если найден — удаляет store, sessions, challenges, installs.
-        2. Если active store не найден — ищет pending install по
+        1. Пытается найти active store по store_id с проверкой shop.
+           Если найден и пароль совпадает — удаляет всё (store, sessions,
+           challenges, installs).
+        2. Если active store найден, но пароль не совпадает (другой
+           установщик) — проверяет pending install с matching credentials
+           и удаляет только его. Active store не трогается.
+        3. Если active store отсутствует — ищет pending install по
            store_id + shop + password и удаляет только его.
 
         Это устраняет race condition, когда между раздельными чтениями
-        store и install другой worker успевает активировать кандидата.
+        store и install другой worker успевает активировать кандидата,
+        а также случай, когда uninstall для P2-кандидата ложно
+        отклоняется из-за несовпадения пароля с active P1.
 
         Возвращает True при успешном удалении.
         """
@@ -377,14 +394,27 @@ class Store:
                 if store_row['shop'] != shop:
                     return False
                 from insales.crypto import secure_compare
-                if not secure_compare(password, store_row['password']):
-                    return False
-                # Active store найден — удаляем всё
-                conn.execute('DELETE FROM sessions WHERE store_id=?', (store_id,))
-                conn.execute('DELETE FROM challenges WHERE store_id=?', (store_id,))
-                conn.execute('DELETE FROM installs WHERE store_id=?', (store_id,))
-                conn.execute('DELETE FROM stores WHERE id=?', (store_id,))
-                return True
+                if secure_compare(password, store_row['password']):
+                    # Active store найден с совпадающим паролем — удаляем всё
+                    conn.execute('DELETE FROM sessions WHERE store_id=?', (store_id,))
+                    conn.execute('DELETE FROM challenges WHERE store_id=?', (store_id,))
+                    conn.execute('DELETE FROM installs WHERE store_id=?', (store_id,))
+                    conn.execute('DELETE FROM stores WHERE id=?', (store_id,))
+                    return True
+                # Active store есть, но пароль не совпал (другой установщик).
+                # Проверяем pending install с matching credentials.
+                install = conn.execute(
+                    'SELECT * FROM installs WHERE store_id=? AND shop=? AND password=?'
+                    ' ORDER BY generation DESC LIMIT 1',
+                    (store_id, shop, password),
+                ).fetchone()
+                if install is not None:
+                    conn.execute(
+                        'DELETE FROM installs WHERE candidate=?',
+                        (install['candidate'],),
+                    )
+                    return True
+                return False
 
             # Шаг 2: active store нет — ищем pending install
             install = conn.execute(

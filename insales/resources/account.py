@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from insales.errors import ResourceError
 from insales.resources.base import Resource
 
 
@@ -18,7 +19,7 @@ class Account(Resource):
         """Получить данные аккаунта текущего магазина."""
         resp = self._get(self._collection)
         if not isinstance(resp.data, dict):
-            raise TypeError(
-                f'Expected account object, got {type(resp.data).__name__}'
+            raise ResourceError(
+                f'Expected account object, got {type(resp.data).__name__}',
             )
         return resp.data
