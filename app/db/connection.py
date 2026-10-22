@@ -18,6 +18,7 @@ SCHEMA_VERSION_TABLE = '''
 MIGRATIONS: list[tuple[int, str, str]] = [
     (1, 'Начальная схема', '0001_initial.sql'),
     (2, 'Добавлен generation в sessions', '0002_sessions_generation.sql'),
+    (3, 'Webhook-подписки и inbox', '0003_webhooks.sql'),
 ]
 
 _SCHEMA_DIR = Path(__file__).parent / 'migrations'

@@ -1,165 +1,91 @@
 """HTTP-клиент для API InSales.
 
-Поддерживает Basic-аутентификацию (app_id + store_password),
-ограничение размера ответа, таймауты, отказ от следования редиректам
-и заголовки лимитов API.
+Фасад над Transport + Resource. Собирает ресурсы в атрибуты:
+    client.account.get()
+    client.webhooks.list()
+    client.orders.get(order_id)
 
-Допустимые успешные статусы: 200, 201.
-Пустой ответ (202, 204, пустое тело 200) возвращает None.
+Совместимость: старые методы (get, post, put, delete, get_account, verify_identity)
+оставлены для плавного перехода.
 """
 from __future__ import annotations
 
-import base64
-import http.client
-import json
-import re
 from typing import Any
 
-MAX_RESPONSE_BYTES = 2_000_000
-REQUEST_TIMEOUT = 10
-_OK_STATUSES = {200, 201}
-
-_LOOPBACK_HOSTS = frozenset({'127.0.0.1', '::1', 'localhost'})
-
-
-class ApiError(Exception):
-    """Ошибка API InSales."""
-
-    def __init__(self, status: int, body: str = '',
-                 usage: str | None = None,
-                 retry_after: str | None = None):
-        self.status = status
-        self.body = body
-        self.usage = usage
-        self.retry_after = retry_after
-
-    def __str__(self) -> str:
-        parts = [f'HTTP {self.status}']
-        if self.usage:
-            parts.append(f'usage={self.usage}')
-        if self.retry_after:
-            parts.append(f'retry_after={self.retry_after}')
-        return ' | '.join(parts)
-
-    @property
-    def is_temporary(self) -> bool:
-        """429, 5xx и сетевые обрывы — временные ошибки."""
-        return self.status in (429,) or self.status >= 500
-
-
-def validate_shop(shop: str) -> str:
-    """Валидация домена магазина (базовая проверка формата)."""
-    shop = shop.lower().strip()
-    m = re.fullmatch(r'([a-z0-9][a-z0-9.\-]*)(?::(\d{1,5}))?', shop)
-    if not m:
-        raise ValueError(f'Invalid shop domain format: {shop}')
-    return shop
-
-
-def _parse_shop(shop: str) -> tuple[str, int | None]:
-    """Разобрать shop на host и опциональный port."""
-    m = re.fullmatch(r'([a-z0-9][a-z0-9.\-]*)(?::(\d{1,5}))?', shop.lower().strip())
-    if not m:
-        raise ValueError(f'Invalid shop domain format: {shop}')
-    host = m.group(1)
-    port = int(m.group(2)) if m.group(2) else None
-    return host, port
+# Совместимость: реэкспорт для старых импортов
+from insales.errors import ApiError  # noqa: F401
+from insales.resources.account import Account
+from insales.resources.orders import Orders
+from insales.resources.products import Products
+from insales.resources.webhooks import Webhooks
+from insales.transport import (  # noqa: F401
+    MAX_RESPONSE_BYTES,  # noqa: F401
+    Transport,
+    validate_shop,
+)
 
 
 class InSalesClient:
-    """Клиент InSales API для одного магазина."""
+    """Клиент InSales API для одного магазина.
+
+    Использование:
+        client = InSalesClient(shop='shop.example',
+                                app_id='app', password='pwd')
+        account = client.account.get()
+        hooks = client.webhooks.list()
+    """
 
     def __init__(self, shop: str, app_id: str, password: str,
                  dev: bool = False):
-        host, port = _parse_shop(shop)
-        self.shop = host
-        self.port = port
-        self.app_id = app_id
-        self.password = password
-        self._basic = base64.b64encode(
-            f'{app_id}:{password}'.encode()
-        ).decode()
-        self._dev = dev
+        self._transport = Transport(shop=shop, app_id=app_id,
+                                    password=password, dev=dev)
 
-    def _connect(self) -> http.client.HTTPConnection:
-        kwargs = {'timeout': REQUEST_TIMEOUT}
-        if self.port:
-            kwargs['port'] = self.port
-        if self._dev and self.shop in _LOOPBACK_HOSTS:
-            # HTTP только для loopback-хостов в dev-режиме
-            return http.client.HTTPConnection(self.shop, **kwargs)
-        return http.client.HTTPSConnection(self.shop, **kwargs)
+        # Ресурсы
+        self.account = Account(self._transport)
+        self.webhooks = Webhooks(self._transport)
+        self.orders = Orders(self._transport)
+        self.products = Products(self._transport)
 
-    def _request(self, method: str, path: str,
-                 body: bytes | None = None,
-                 content_type: str | None = None) -> tuple[Any, str | None]:
-        """Выполнить запрос к API. Не следует редиректам."""
-        headers = {
-            'Authorization': f'Basic {self._basic}',
-            'Accept': 'application/json',
-        }
-        if body is not None:
-            headers['Content-Type'] = content_type or 'application/json'
+        # Совместимость: fill-in для ещё не созданных ресурсов
 
-        conn = self._connect()
-        try:
-            conn.request(method, path, body=body, headers=headers)
-            response = conn.getresponse()
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
-            if len(raw) > MAX_RESPONSE_BYTES:
-                raise ValueError('API response too large')
-            usage = response.getheader('API-Usage-Limit')
-            retry_after = response.getheader('Retry-After')
+    # ---- Совместимость со старым API ----
 
-            if response.status not in _OK_STATUSES:
-                raise ApiError(
-                    status=response.status,
-                    body=raw.decode('utf-8', errors='replace'),
-                    usage=usage,
-                    retry_after=retry_after,
-                )
+    @property
+    def shop(self) -> str:
+        return self._transport.shop
 
-            if not raw.strip():
-                return None, usage
+    @property
+    def app_id(self) -> str:
+        return self._transport.app_id
 
-            return json.loads(raw), usage
-        finally:
-            conn.close()
+    @property
+    def password(self) -> str:
+        return self._transport.password
 
     def get(self, path: str) -> tuple[Any, str | None]:
-        """GET-запрос к InSales API."""
-        return self._request('GET', path)
+        """(legacy) GET-запрос, возвращает (data, usage)."""
+        resp = self._transport.get(path)
+        return resp.data, resp.usage
 
     def post(self, path: str, data: Any) -> tuple[Any, str | None]:
-        """POST-запрос с JSON-телом."""
-        return self._request('POST', path,
-                             body=json.dumps(data).encode(),
-                             content_type='application/json')
+        """(legacy) POST-запрос, возвращает (data, usage)."""
+        resp = self._transport.post(path, data)
+        return resp.data, resp.usage
 
     def put(self, path: str, data: Any) -> tuple[Any, str | None]:
-        """PUT-запрос с JSON-телом."""
-        return self._request('PUT', path,
-                             body=json.dumps(data).encode(),
-                             content_type='application/json')
+        """(legacy) PUT-запрос, возвращает (data, usage)."""
+        resp = self._transport.put(path, data)
+        return resp.data, resp.usage
 
     def delete(self, path: str) -> tuple[Any, str | None]:
-        """DELETE-запрос."""
-        return self._request('DELETE', path)
+        """(legacy) DELETE-запрос, возвращает (data, usage)."""
+        resp = self._transport.delete(path)
+        return resp.data, resp.usage
 
     def get_account(self) -> tuple[dict, str | None]:
-        """Получить информацию о магазине (/admin/account.json).
-
-        Возвращает account-словарь. Гарантирует, что это dict, а не list.
-        """
-        result, usage = self.get('/admin/account.json')
-        if not isinstance(result, dict):
-            raise ValueError(f'Expected account object, got {type(result).__name__}')
-        return result, usage
+        """(legacy) Получить данные аккаунта магазина."""
+        return self._transport.get_account_data()
 
     def verify_identity(self, expected_store_id: str) -> bool:
-        """Проверить, что магазин с данным ID возвращается account API."""
-        try:
-            account, _ = self.get_account()
-            return str(account.get('id')) == str(expected_store_id)
-        except (ApiError, OSError, ValueError, TypeError):
-            return False
+        """(legacy) Проверить, что credentials соответствуют store_id."""
+        return self._transport.verify_identity(expected_store_id)

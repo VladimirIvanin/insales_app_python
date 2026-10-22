@@ -8,8 +8,20 @@ from pathlib import Path
 from flask import Flask
 
 from app.config import Settings
+from app.integrations.insales.handlers.orders import (
+    handle_order_create,
+    handle_order_delete,
+    handle_order_update,
+)
+from app.integrations.insales.subscriptions import SubscriptionService
+from app.integrations.insales.webhook_dispatcher import WebhookDispatcher
+from app.integrations.insales.webhook_receiver import WebhookReceiver
 from app.middleware import SessionMiddleware
+from app.repositories.webhook_inbox import WebhookInbox
+from app.repositories.webhook_subscriptions import WebhookSubscriptions
 from app.routes import create_routes
+from app.webhook_routes import create_webhook_routes
+from app.workers.webhooks import WebhookWorker
 from insales.lifecycle import Lifecycle
 from insales.store import Store
 
@@ -74,6 +86,40 @@ def create_app(settings: Settings | None = None) -> Flask:
     # --- Routes ---
     blueprint = create_routes(store, lifecycle, mw, settings.base_url)
     app.register_blueprint(blueprint)
+
+    # --- Webhook infrastructure ---
+    webhook_subs = WebhookSubscriptions(store)
+    webhook_inbox = WebhookInbox(store)
+    subscription_service = SubscriptionService(webhook_subs, settings.base_url)
+
+    webhook_dispatcher = WebhookDispatcher()
+    webhook_dispatcher.register('orders/create', handle_order_create)
+    webhook_dispatcher.register('orders/update', handle_order_update)
+    webhook_dispatcher.register('orders/delete', handle_order_delete)
+
+    webhook_receiver = WebhookReceiver(webhook_subs, webhook_inbox)
+
+    wh_blueprint = create_webhook_routes(webhook_receiver)
+    app.register_blueprint(wh_blueprint)
+
+    # --- Webhook worker ---
+    webhook_worker = WebhookWorker(webhook_inbox, webhook_dispatcher)
+
+    # Сохраняем ссылки для доступа из middleware/routes
+    app.extensions = {
+        'store': store,
+        'lifecycle': lifecycle,
+        'mw': mw,
+        'webhook_subs': webhook_subs,
+        'webhook_inbox': webhook_inbox,
+        'subscription_service': subscription_service,
+        'webhook_dispatcher': webhook_dispatcher,
+        'webhook_worker': webhook_worker,
+    }
+
+    # --- Запуск ---
+    lifecycle.start()
+    webhook_worker.start()
 
     # --- Обработчики ошибок ---
     @app.errorhandler(404)

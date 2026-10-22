@@ -10,7 +10,7 @@ import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from insales.client import ApiError, InSalesClient, validate_shop
+from insales.client import InSalesClient
 from insales.crypto import (
     generate_nonce,
     generate_session_id,
@@ -18,7 +18,9 @@ from insales.crypto import (
     sign_token3,
     store_password,
 )
+from insales.errors import ApiError
 from insales.store import Store
+from insales.transport import validate_shop
 
 INSTALL_WORKERS = 2
 CHALLENGE_TTL = 300  # 5 минут
