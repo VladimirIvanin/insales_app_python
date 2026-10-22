@@ -1,0 +1,47 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+runtime/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Coverage
+.coverage*
+htmlcov/
+
+# Ruff cache
+.ruff_cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.whl
+
+# Local review artifacts
+.agents/ревью/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
