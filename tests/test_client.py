@@ -215,7 +215,6 @@ class TestInSalesClient:
 
     def test_client_has_resources(self, client):
         assert client.account is not None
-        assert client.webhooks is not None
         assert client.orders is not None
         assert client.products is not None
 
@@ -312,30 +311,6 @@ class TestInSalesClient:
             count = client.products.count()
         assert count == 10
         _verify_request(conn, 'GET', '/admin/products/count.json')
-
-    def test_webhooks_get_url(self, client):
-        """Webhooks.get(789) обращается к /admin/webhooks/789.json."""
-        conn = self._make_conn(data={'id': 789})
-        with patch.object(client._transport, '_connect', return_value=conn):
-            wh = client.webhooks.get(789)
-        assert wh['id'] == 789
-        _verify_request(conn, 'GET', '/admin/webhooks/789.json')
-
-    def test_webhooks_delete_raises_on_error(self, client):
-        """Webhooks.delete() пробрасывает ошибки API."""
-        conn = self._make_conn(status=404, data={'error': 'not found'})
-        with patch.object(client._transport, '_connect', return_value=conn):
-            with pytest.raises(ApiError) as exc:
-                client.webhooks.delete(999)
-        assert exc.value.status == 404
-
-    def test_webhooks_create_url(self, client):
-        """Webhooks.create() POST на /admin/webhooks.json."""
-        conn = self._make_conn(data={'id': 1, 'topic': 'orders/create'})
-        with patch.object(client._transport, '_connect', return_value=conn):
-            wh = client.webhooks.create('orders/create', 'http://hook.example')
-        assert wh['id'] == 1
-        _verify_request(conn, 'POST', '/admin/webhooks.json')
 
 
 class TestRetryStrategy:

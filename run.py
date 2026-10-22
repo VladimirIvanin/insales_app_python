@@ -14,12 +14,14 @@ from __future__ import annotations
 import os
 
 from app.config import Settings
-from app.factory import create_app
+from app.db.connection import upgrade as db_upgrade
 
 
 def main() -> None:
     os.umask(0o077)
     settings = Settings.from_env()
+    db_upgrade(settings.db_path)
+    from app.factory import create_app
     app = create_app(settings)
     app.run(host=settings.bind_host, port=settings.port,
             debug=settings.flask_debug)
