@@ -19,6 +19,17 @@ from insales.lifecycle import Lifecycle, LifecycleError
 from insales.store import Store
 
 
+def _parse_host(hostport: str) -> str:
+    """Извлечь host из строки вида 'host', 'host:port' или '[IPv6]:port'."""
+    if hostport.startswith('['):
+        # [::1]:8765 → ::1
+        bracket = hostport.find(']')
+        if bracket != -1:
+            return hostport[1:bracket]
+    # 127.0.0.1:8765 → 127.0.0.1
+    return hostport.split(':')[0]
+
+
 def _is_loopback(host: str) -> bool:
     """Проверить, что хост — loopback (для HTTP в dev)."""
     return host in ('127.0.0.1', '::1', 'localhost')
@@ -34,7 +45,7 @@ def _login_scheme(base_url: str, dev: bool, shop: str) -> str:
 
     HTTPS для всех, кроме loopback в dev-режиме.
     """
-    if dev and _is_loopback(shop.split(':')[0]):
+    if dev and _is_loopback(_parse_host(shop)):
         return 'http'
     return 'https'
 

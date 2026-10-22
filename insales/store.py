@@ -395,10 +395,15 @@ class Store:
                     return False
                 from insales.crypto import secure_compare
                 if secure_compare(password, store_row['password']):
-                    # Active store найден с совпадающим паролем — удаляем всё
+                    # Active store найден с совпадающим паролем — удаляем всё,
+                    # но только installs своего поколения (чтобы не уничтожить
+                    # pending кандидата от новой установки)
                     conn.execute('DELETE FROM sessions WHERE store_id=?', (store_id,))
                     conn.execute('DELETE FROM challenges WHERE store_id=?', (store_id,))
-                    conn.execute('DELETE FROM installs WHERE store_id=?', (store_id,))
+                    conn.execute(
+                        'DELETE FROM installs WHERE store_id=? AND generation=?',
+                        (store_id, store_row['generation']),
+                    )
                     conn.execute('DELETE FROM stores WHERE id=?', (store_id,))
                     return True
                 # Active store есть, но пароль не совпал (другой установщик).

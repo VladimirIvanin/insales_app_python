@@ -45,19 +45,37 @@ class WebhookSubscriptions:
                    VALUES (?, ?, ?, ?, ?, ?, 'active', julianday('now'), julianday('now'))
                    ON CONFLICT(store_id, topic) DO UPDATE SET
                        generation=excluded.generation,
-                       callback_secret=excluded.callback_secret,
-                       address=excluded.address,
+                       callback_secret=COALESCE(
+                           (SELECT callback_secret FROM webhook_subscriptions
+                            WHERE store_id=excluded.store_id AND topic=excluded.topic
+                              AND generation=excluded.generation),
+                           excluded.callback_secret
+                       ),
+                       address=COALESCE(
+                           (SELECT address FROM webhook_subscriptions
+                            WHERE store_id=excluded.store_id AND topic=excluded.topic
+                              AND generation=excluded.generation),
+                           excluded.address
+                       ),
                        format_type=excluded.format_type,
                        state='active',
-                       insales_id=NULL,
-                       updated_at=julianday('now')
+                       insales_id=COALESCE(
+                           (SELECT insales_id FROM webhook_subscriptions
+                            WHERE store_id=excluded.store_id AND topic=excluded.topic
+                              AND generation=excluded.generation),
+                           NULL
+                       ),
+                       updated_at=
+                           CASE WHEN generation = excluded.generation
+                           THEN updated_at
+                           ELSE julianday('now') END
                    WHERE generation <= excluded.generation''',
                 (store_id, generation, topic, secret,
                  address, format_type),
             )
 
-        # После upsert читаем запись по store_id+topic
-        return self.get_by_store_and_topic(store_id, topic)
+        # После upsert читаем именно созданную запись по secret
+        return self.get_by_secret(secret)
 
     def get(self, sub_id: int) -> SubscriptionRow | None:
         """Получить подписку по ID."""

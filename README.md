@@ -331,7 +331,7 @@ application = create_app()
 gunicorn 'app:create_app()' --bind 0.0.0.0:8000 --workers 4
 
 # Waitress
-waitress-serve --host 0.0.0.0 --port 8000 'app:create_app()'
+waitress-serve --call --host 0.0.0.0 --port 8000 'app:create_app'
 ```
 
 Приложение должно работать за HTTPS-terminating reverse proxy (nginx, Caddy). Webhook-уведомления от InSales приходят только на HTTPS.
