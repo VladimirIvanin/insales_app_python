@@ -12,61 +12,92 @@ from __future__ import annotations
 
 from typing import Any
 
+from insales.errors import ResourceError
 from insales.resources.base import Resource
 
 
 class Products(Resource):
     """Товары InSales."""
 
-    _path = '/admin/products.json'
+    _collection_path = '/admin/products.json'
+    _count_path = '/admin/products/count.json'
 
     def list(self, page: int = 1, per_page: int = 50,
              **filters: Any) -> list[dict[str, Any]]:
-        """Получить список товаров."""
-        params = [f'page={page}', f'per_page={per_page}']
-        for key, value in filters.items():
-            if value is not None:
-                params.append(f'{key}={value}')
-        path = f'{self._path}?{"&".join(params)}'
+        """Получить список товаров.
+
+        Returns:
+            Список товаров.
+
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
+            ResourceError: При неожиданном формате ответа.
+        """
+        path = self._collection + self._build_query(
+            page=page, per_page=per_page, **filters
+        )
         resp = self._get(path)
         if not isinstance(resp.data, list):
-            return []
+            raise ResourceError(
+                f'Expected list of products, got {type(resp.data).__name__}'
+            )
         return resp.data
 
-    def get(self, product_id: int) -> dict[str, Any] | None:
-        """Получить товар по ID."""
-        try:
-            resp = self._get(self._make_path(f'{product_id}.json'))
-            if isinstance(resp.data, dict):
-                return resp.data
-            return None
-        except Exception:
-            return None
+    def get(self, product_id: int) -> dict[str, Any]:
+        """Получить товар по ID.
+
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
+            ResourceError: При неожиданном формате ответа.
+        """
+        resp = self._get(self._object_path(product_id))
+        if not isinstance(resp.data, dict):
+            raise ResourceError(
+                f'Expected product object, got {type(resp.data).__name__}'
+            )
+        return resp.data
 
     def count(self, **filters: Any) -> int:
-        """Количество товаров."""
-        params = []
-        for key, value in filters.items():
-            if value is not None:
-                params.append(f'{key}={value}')
-        path = '/admin/products/count.json'
-        if params:
-            path = f'{path}?{"&".join(params)}'
-        try:
-            resp = self._get(path)
-            if isinstance(resp.data, dict):
-                return resp.data.get('count', 0)
-            return 0
-        except Exception:
-            return 0
+        """Количество товаров.
+
+        Returns:
+            Число товаров.
+
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
+            ResourceError: При неожиданном формате ответа.
+        """
+        path = self._count_path + self._build_query(**filters)
+        resp = self._get(path)
+        if not isinstance(resp.data, dict):
+            raise ResourceError(
+                f'Expected count object, got {type(resp.data).__name__}'
+            )
+        count = resp.data.get('count')
+        if count is None or not isinstance(count, (int, float)):
+            raise ResourceError(
+                f'Missing or invalid "count" field in response: {resp.data!r}'
+            )
+        return int(count)
 
     def update(self, product_id: int,
-               data: dict[str, Any]) -> dict[str, Any] | None:
-        """Обновить товар."""
-        try:
-            resp = self._put(self._make_path(f'{product_id}.json'), data)
-            if isinstance(resp.data, dict):
-                return resp.data
-            return None
-        except Exception:
-            return None
+               data: dict[str, Any]) -> dict[str, Any]:
+        """Обновить товар.
+
+        Returns:
+            Обновлённый товар.
+
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
+            ResourceError: При неожиданном формате ответа.
+        """
+        resp = self._put(self._object_path(product_id), data)
+        if not isinstance(resp.data, dict):
+            raise ResourceError(
+                f'Expected product object, got {type(resp.data).__name__}'
+            )
+        return resp.data

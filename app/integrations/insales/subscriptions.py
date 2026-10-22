@@ -91,7 +91,11 @@ class SubscriptionService:
 
     def _create_remote_with_retry(self, client: InSalesClient,
                                    topic: str, address: str) -> dict | None:
-        """Создать вебхук в InSales с ограниченным числом повторов."""
+        """Создать вебхук в InSales с ограниченным числом повторов.
+
+        Returns:
+            Созданный вебхук или None, если не удалось (постоянная ошибка).
+        """
         for attempt in range(self._retry.max_retries + 1):
             try:
                 return client.webhooks.create(
@@ -107,7 +111,6 @@ class SubscriptionService:
                 time.sleep(delay)
                 continue
             except OSError:
-                # Сетевые ошибки не повторяем
                 return None
         return None
 
@@ -142,9 +145,8 @@ class SubscriptionService:
             insales_id = sub.get('insales_id')
             if insales_id is not None:
                 try:
-                    ok = client.webhooks.delete(insales_id)
-                    if ok:
-                        deleted += 1
+                    client.webhooks.delete(insales_id)
+                    deleted += 1
                 except (ApiError, OSError):
                     pass
         self._subs.delete_by_store(store_id)

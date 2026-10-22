@@ -2,17 +2,19 @@
 
 Заготовка устанавливаемого партнёрского приложения для платформы [InSales](https://www.insales.ru/) на Python и Flask.
 
-Включает обработчики установки и удаления, вход сотрудников магазина по token3, HTTP-клиент API InSales и серверные сессии. Используйте её как основу для бизнес-логики своего приложения.
+Включает обработчики установки и удаления, вход сотрудников магазина по token3, HTTP-клиент API InSales, серверные сессии, фоновую обработку webhook-уведомлений и CLI-диагностику. Используйте её как основу для бизнес-логики своего приложения.
 
 ## Возможности
 
 - **Install** — установка приложения в магазин через Basic API с фоновой верификацией
 - **Login/Autologin** — вход сотрудника магазина через token3 с одноразовым challenge
 - **Uninstall** — удаление приложения с атомарным отзывом доступа
-- **API client** — HTTP-клиент InSales API с Basic-аутентификацией
+- **API client** — HTTP-клиент InSales API с Basic-аутентификацией и типизированными ресурсами
+- **Webhooks** — приём уведомлений, диспетчеризация по теме, фоновый worker с повторными попытками
 - **Session management** — серверные сессии с привязкой к поколению установки
 - **Tenant isolation** — изоляция данных магазинов на уровне middleware
 - **Миграции БД** — версионирование схемы SQLite с линейными миграциями
+- **CLI** — `serve`, `db upgrade/status`, `doctor`, `webhook list/get/retry`
 
 ## Подготовка приложения в InSales
 
@@ -34,7 +36,7 @@ pip install -r requirements.txt
 cp .env.example .env
 # Заполните .env своими значениями
 
-# Запустить сервер
+# Запустить сервер (БД обновится автоматически)
 python run.py
 
 # Или через CLI:
@@ -71,6 +73,155 @@ python -m app.cli serve
 | GET | `/uninstall` | Callback удаления от InSales |
 | GET | `/` | Dashboard (требуется сессия) |
 | GET | `/probe` | Read-only проверка API магазина |
+| POST | `/webhook/insales?token=<secret>` | Приём webhook-уведомлений от InSales |
+
+## Webhook-инфраструктура
+
+Приложение поддерживает полный цикл обработки webhook-уведомлений:
+
+1. **Подписка** — `SubscriptionService` регистрирует стандартные темы (`orders/create`, `products/update` и т.д.) после активации магазина. Локальная запись создаётся первой, затем удалённый вебхук через API InSales.
+2. **Приём** — `POST /webhook/insales?token=<callback_secret>` принимает уведомления, валидирует подпись, сохраняет в `webhook_inbox`.
+3. **Диспетчеризация** — `WebhookDispatcher` маршрутизирует по теме к зарегистрированным handler'ам.
+4. **Фоновый worker** — `WebhookWorker` в отдельном потоке атомарно захватывает события из inbox, диспатчит и отмечает успех/неудачу. Временные ошибки повторяются с exponential backoff до 5 попыток.
+
+Worker запускается автоматически при старте сервера. Для ручного управления очередью используйте CLI (см. ниже).
+
+Написание своего handler'а:
+
+```python
+# app/integrations/insales/handlers/orders.py
+from app.integrations.insales.webhook_dispatcher import handler
+
+@handler('orders/paid')
+def handle_order_paid(store_id: str, generation: int, topic: str, payload: dict) -> bool:
+    # Ваша бизнес-логика
+    return True  # True = успех, False = ошибка (без повтора)
+```
+
+## CLI-команды
+
+### Диагностика системы
+
+```bash
+# Проверка конфигурации, БД и подключения ко всем магазинам
+python -m app.cli doctor
+```
+
+Команда `doctor` проверяет:
+- Наличие обязательных переменных окружения
+- Файл базы данных и его размер
+- Статус всех миграций
+- Подключение к API каждого установленного магазина (через `account.json`)
+
+### Управление очередью webhook-событий
+
+```bash
+# Список последних 20 событий
+python -m app.cli webhook list
+
+# Список последних 50 событий
+python -m app.cli webhook list 50
+
+# Детали события
+python -m app.cli webhook get 42
+
+# Повтор сбойного события (сброс в pending)
+python -m app.cli webhook retry 42
+```
+
+### База данных
+
+```bash
+# Статус миграций
+python -m app.cli db status
+
+# Применить неприменённые миграции
+python -m app.cli db upgrade
+```
+
+## API-клиент InSales
+
+Клиент построен по паттерну **Transport + Resource**. Transport отвечает за HTTP (Basic-аутентификация, повторные попытки, обработка лимитов), Resource — за формирование правильных URL и разбор ответов.
+
+### Примеры использования
+
+```python
+from insales.client import InSalesClient
+
+client = InSalesClient(
+    shop='shop-123.myinsales.ru',
+    app_id='my-partner-app',
+    password='password',
+    dev=False,           # True для локальной отладки (HTTP для loopback)
+)
+
+# Аккаунт
+account = client.account.get()
+print(account['title'])
+
+# Список заказов с фильтрами
+orders = client.orders.list(
+    page=1,
+    per_page=50,
+    created_at_from='2024-01-01',
+    status='paid',
+)
+
+# Один заказ
+order = client.orders.get(123)
+
+# Количество по фильтрам
+count = client.orders.count(status='new')
+
+# Обновление
+client.orders.update(123, {'order': {'status': 'cancelled'}})
+
+# Товары
+product = client.products.get(456)
+products = client.products.list(page=1, per_page=100)
+
+# Вебхуки
+hooks = client.webhooks.list()
+new_hook = client.webhooks.create(
+    topic='orders/create',
+    address='https://ваш-домен/webhook/insales?token=xxx',
+    format_type='json',
+)
+client.webhooks.delete(42)
+```
+
+### Обработка ошибок
+
+Методы ресурсов **не скрывают ошибки** — все исключения пробрасываются наверх:
+
+```python
+from insales.errors import ApiError, TransportError, ResourceError
+
+try:
+    order = client.orders.get(999)
+except ApiError as exc:
+    print(f'HTTP {exc.status}: {exc.body}')
+except TransportError as exc:
+    print(f'Network error: {exc}')
+except ResourceError as exc:
+    print(f'Unexpected response format: {exc}')
+```
+
+### Формирование URL
+
+URL строятся через `_collection_path` и `_object_path()`:
+
+| Метод | Путь |
+|-------|------|
+| `orders.list()` | `GET /admin/orders.json?page=1&per_page=50` |
+| `orders.get(123)` | `GET /admin/orders/123.json` |
+| `orders.count()` | `GET /admin/orders/count.json` |
+| `orders.update(123, ...)` | `PUT /admin/orders/123.json` |
+| `products.get(456)` | `GET /admin/products/456.json` |
+| `webhooks.create(...)` | `POST /admin/webhooks.json` |
+| `webhooks.delete(42)` | `DELETE /admin/webhooks/42.json` |
+
+Параметры query string кодируются через `urllib.parse.urlencode` — даты с пробелами, массивы и спецсимволы обрабатываются корректно.
 
 ## БД и миграции
 
@@ -97,24 +248,49 @@ insales_app_python/
 │   ├── __init__.py         # Публичный create_app
 │   ├── config.py           # Settings dataclass из env
 │   ├── factory.py          # Фабрика Flask-приложения
-│   ├── cli.py              # CLI: serve, db upgrade, db status
+│   ├── cli.py              # CLI: serve, db upgrade/status, doctor, webhook list/get/retry
 │   ├── middleware.py       # Сессионная middleware + tenant isolation
 │   ├── routes.py           # Flask endpoints
+│   ├── webhook_routes.py   # Приём webhook-уведомлений
 │   ├── db/                 # Слой БД
 │   │   ├── connection.py   # Подключение и миграции
 │   │   └── migrations/     # SQL-миграции
+│   ├── integrations/       # Интеграции с внешними системами
+│   │   └── insales/
+│   │       ├── subscriptions.py     # Управление webhook-подписками
+│   │       ├── webhook_dispatcher.py # Маршрутизация по теме
+│   │       ├── webhook_receiver.py   # Приём и валидация
+│   │       └── handlers/            # Обработчики событий
+│   ├── repositories/       # Репозитории БД
+│   │   ├── webhook_inbox.py
+│   │   └── webhook_subscriptions.py
+│   ├── workers/            # Фоновые worker'ы
+│   │   └── webhooks.py    # Фоновый обработчик webhook-событий
 │   └── templates/          # HTML-шаблоны
+│       ├── dashboard.html
+│       └── probe.html
 ├── insales/                # Независимый слой InSales-протокола
 │   ├── crypto.py           # MD5, подписи token/token2/token3
-│   ├── client.py           # HTTP-клиент API InSales
+│   ├── client.py           # Фасад API-клиента
+│   ├── errors.py           # Иерархия ошибок (ApiError, TransportError, ResourceError)
+│   ├── response.py         # ApiResponse dataclass
 │   ├── store.py            # SQLite Store
-│   └── lifecycle.py        # Логика install/uninstall/login
+│   ├── lifecycle.py        # Логика install/uninstall/login
+│   ├── transport.py        # HTTP-транспорт с Basic-аутентификацией и RetryStrategy
+│   └── resources/          # Типизированные ресурсы API
+│       ├── base.py         # Resource — база с _object_path() и _build_query()
+│       ├── account.py      # GET /admin/account.json
+│       ├── orders.py       # list/get/count/update
+│       ├── products.py     # list/get/count/update
+│       └── webhooks.py     # list/get/create/update/delete
 └── tests/
     ├── conftest.py
+    ├── protocol-vectors.json
+    ├── test_client.py      # HTTP-клиент, ресурсы, URL-сборка, ошибки
     ├── test_crypto.py      # Формулы подписей
-    ├── test_client.py      # HTTP-клиент
     ├── test_store.py       # Схема БД, миграции, транзакции
-    └── test_lifecycle.py   # Поведенческие тесты lifecycle + routes
+    ├── test_lifecycle.py   # Поведенческие тесты lifecycle + routes
+    └── test_webhooks.py    # Подписки, inbox, приём, диспетчер, worker
 ```
 
 ## Разработка
@@ -150,7 +326,7 @@ gunicorn 'app:create_app()' --bind 0.0.0.0:8000 --workers 4
 waitress-serve --host 0.0.0.0 --port 8000 'app:create_app()'
 ```
 
-Приложение должно работать за HTTPS-terminating reverse proxy (nginx, Caddy).
+Приложение должно работать за HTTPS-terminating reverse proxy (nginx, Caddy). Webhook-уведомления от InSales приходят только на HTTPS.
 
 ## Реализованные ограничения
 

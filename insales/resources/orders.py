@@ -11,13 +11,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from insales.errors import ResourceError
 from insales.resources.base import Resource
 
 
 class Orders(Resource):
     """Заказы InSales."""
 
-    _path = '/admin/orders.json'
+    _collection_path = '/admin/orders.json'
+    _count_path = '/admin/orders/count.json'
 
     def list(self, page: int = 1, per_page: int = 50,
              **filters: Any) -> list[dict[str, Any]]:
@@ -31,45 +33,62 @@ class Orders(Resource):
 
         Returns:
             Список заказов.
+
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
+            ResourceError: При неожиданном формате ответа.
         """
-        params = [f'page={page}', f'per_page={per_page}']
-        for key, value in filters.items():
-            if value is not None:
-                params.append(f'{key}={value}')
-        path = f'{self._path}?{"&".join(params)}'
+        path = self._collection + self._build_query(
+            page=page, per_page=per_page, **filters
+        )
         resp = self._get(path)
         if not isinstance(resp.data, list):
-            return []
+            raise ResourceError(
+                f'Expected list of orders, got {type(resp.data).__name__}'
+            )
         return resp.data
 
-    def get(self, order_id: int) -> dict[str, Any] | None:
-        """Получить заказ по ID."""
-        try:
-            resp = self._get(self._make_path(f'{order_id}.json'))
-            if isinstance(resp.data, dict):
-                return resp.data
-            return None
-        except Exception:
-            return None
+    def get(self, order_id: int) -> dict[str, Any]:
+        """Получить заказ по ID.
+
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
+            ResourceError: При неожиданном формате ответа.
+        """
+        resp = self._get(self._object_path(order_id))
+        if not isinstance(resp.data, dict):
+            raise ResourceError(
+                f'Expected order object, got {type(resp.data).__name__}'
+            )
+        return resp.data
 
     def count(self, **filters: Any) -> int:
-        """Количество заказов (с учётом фильтров)."""
-        params = []
-        for key, value in filters.items():
-            if value is not None:
-                params.append(f'{key}={value}')
-        path = '/admin/orders/count.json'
-        if params:
-            path = f'{path}?{"&".join(params)}'
-        try:
-            resp = self._get(path)
-            if isinstance(resp.data, dict):
-                return resp.data.get('count', 0)
-            return 0
-        except Exception:
-            return 0
+        """Количество заказов (с учётом фильтров).
 
-    def update(self, order_id: int, data: dict[str, Any]) -> dict[str, Any] | None:
+        Returns:
+            Число заказов.
+
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
+            ResourceError: При неожиданном формате ответа.
+        """
+        path = self._count_path + self._build_query(**filters)
+        resp = self._get(path)
+        if not isinstance(resp.data, dict):
+            raise ResourceError(
+                f'Expected count object, got {type(resp.data).__name__}'
+            )
+        count = resp.data.get('count')
+        if count is None or not isinstance(count, (int, float)):
+            raise ResourceError(
+                f'Missing or invalid "count" field in response: {resp.data!r}'
+            )
+        return int(count)
+
+    def update(self, order_id: int, data: dict[str, Any]) -> dict[str, Any]:
         """Обновить заказ.
 
         Args:
@@ -77,12 +96,16 @@ class Orders(Resource):
             data: Данные для обновления в формате {'order': {...}}.
 
         Returns:
-            Обновлённый заказ или None.
+            Обновлённый заказ.
+
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
+            ResourceError: При неожиданном формате ответа.
         """
-        try:
-            resp = self._put(self._make_path(f'{order_id}.json'), data)
-            if isinstance(resp.data, dict):
-                return resp.data
-            return None
-        except Exception:
-            return None
+        resp = self._put(self._object_path(order_id), data)
+        if not isinstance(resp.data, dict):
+            raise ResourceError(
+                f'Expected order object, got {type(resp.data).__name__}'
+            )
+        return resp.data

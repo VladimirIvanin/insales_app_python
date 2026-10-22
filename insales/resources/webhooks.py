@@ -13,35 +13,52 @@ from __future__ import annotations
 
 from typing import Any
 
+from insales.errors import ResourceError
 from insales.resources.base import Resource
 
 
 class Webhooks(Resource):
     """Вебхуки InSales."""
 
-    _path = '/admin/webhooks.json'
+    _collection_path = '/admin/webhooks.json'
 
     def list(self, page: int = 1, per_page: int = 100) -> list[dict[str, Any]]:
-        """Получить список вебхуков."""
-        path = f'{self._path}?page={page}&per_page={per_page}'
+        """Получить список вебхуков.
+
+        Returns:
+            Список вебхуков.
+
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
+            ResourceError: При неожиданном формате ответа.
+        """
+        path = self._collection + self._build_query(page=page, per_page=per_page)
         resp = self._get(path)
         if not isinstance(resp.data, list):
-            return []
+            raise ResourceError(
+                f'Expected list of webhooks, got {type(resp.data).__name__}'
+            )
         return resp.data
 
-    def get(self, webhook_id: int) -> dict[str, Any] | None:
-        """Получить вебхук по ID."""
-        try:
-            resp = self._get(self._make_path(webhook_id))
-            if isinstance(resp.data, dict):
-                return resp.data
-            return None
-        except Exception:
-            return None
+    def get(self, webhook_id: int) -> dict[str, Any]:
+        """Получить вебхук по ID.
+
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
+            ResourceError: При неожиданном формате ответа.
+        """
+        resp = self._get(self._object_path(webhook_id))
+        if not isinstance(resp.data, dict):
+            raise ResourceError(
+                f'Expected webhook object, got {type(resp.data).__name__}'
+            )
+        return resp.data
 
     def create(self, topic: str, address: str,
                format_type: str = 'json',
-               **extra: Any) -> dict[str, Any] | None:
+               **extra: Any) -> dict[str, Any]:
         """Создать вебхук.
 
         Args:
@@ -51,7 +68,12 @@ class Webhooks(Resource):
             extra: Дополнительные поля (например, include_fields).
 
         Returns:
-            Созданный вебхук или None при ошибке.
+            Созданный вебхук.
+
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
+            ResourceError: При неожиданном формате ответа.
         """
         data: dict[str, Any] = {
             'webhook': {
@@ -61,19 +83,29 @@ class Webhooks(Resource):
                 **extra,
             },
         }
-        resp = self._post(self._path, data)
-        if isinstance(resp.data, dict):
-            return resp.data
-        return None
+        resp = self._post(self._collection, data)
+        if not isinstance(resp.data, dict):
+            raise ResourceError(
+                f'Expected webhook object, got {type(resp.data).__name__}'
+            )
+        return resp.data
 
     def update(self, webhook_id: int,
                topic: str | None = None,
                address: str | None = None,
                format_type: str | None = None,
-               **extra: Any) -> dict[str, Any] | None:
+               **extra: Any) -> dict[str, Any]:
         """Обновить вебхук.
 
         Передаются только поля, которые нужно изменить.
+
+        Returns:
+            Обновлённый вебхук.
+
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
+            ResourceError: При неожиданном формате ответа.
         """
         wh: dict[str, Any] = {}
         if topic is not None:
@@ -85,19 +117,18 @@ class Webhooks(Resource):
         wh.update(extra)
 
         data: dict[str, Any] = {'webhook': wh}
-        resp = self._put(self._make_path(webhook_id), data)
-        if isinstance(resp.data, dict):
-            return resp.data
-        return None
+        resp = self._put(self._object_path(webhook_id), data)
+        if not isinstance(resp.data, dict):
+            raise ResourceError(
+                f'Expected webhook object, got {type(resp.data).__name__}'
+            )
+        return resp.data
 
-    def delete(self, webhook_id: int) -> bool:
+    def delete(self, webhook_id: int) -> None:
         """Удалить вебхук по ID.
 
-        Returns:
-            True, если удаление успешно (204 или 200).
+        Raises:
+            ApiError: При неуспешном HTTP-статусе.
+            TransportError: При сетевых ошибках.
         """
-        try:
-            self._delete(self._make_path(webhook_id))
-            return True
-        except Exception:
-            return False
+        self._delete(self._object_path(webhook_id))
