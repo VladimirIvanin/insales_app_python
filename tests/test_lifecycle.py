@@ -257,9 +257,10 @@ class TestVerifyInstall:
         mock_client = MagicMock()
         mock_client.get_account.side_effect = ApiError(403)
         with patch.object(lifecycle, '_make_client', return_value=mock_client):
-            with pytest.raises(LifecycleError, match='API rejected'):
-                lifecycle.verify_pending_install('42', 'shop.example')
+            # При 403 с активным магазином возвращается его store_id
+            result = lifecycle.verify_pending_install('42', 'shop.example')
 
+        assert result == '42'  # активное подключение сохранено
         store_row = store.get_store('42')
         assert store_row is not None
         assert store_row['password'] == store_row_before['password']

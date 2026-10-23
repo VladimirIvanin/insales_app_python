@@ -102,7 +102,7 @@ def test_upgrade_status(tmp_db):
     st2 = status(tmp_db)
     for entry in st2:
         if entry['version'] == 'current':
-            assert entry['applied'] == 6
+            assert entry['applied'] == 7
 
 
 def test_generation_monotonic_after_upgrade(tmp_db):

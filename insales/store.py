@@ -70,23 +70,36 @@ class Store:
 
     @staticmethod
     def _reserve_generation(conn: sqlite3.Connection, now_ms: int) -> int:
-        """Атомарно зарезервировать и сохранить следующее поколение."""
-        # Читаем старое значение
+        """Атомарно зарезервировать и сохранить следующее поколение.
+
+        Использует UPDATE RETURNING для атомарного read-modify-write
+        в одной операции (защита от гонки backend-3).
+        """
         row = conn.execute(
-            'SELECT last_generation FROM generation_counter WHERE rowid=1'
+            '''UPDATE generation_counter
+               SET last_generation = MAX(last_generation + 1, ?)
+               WHERE rowid=1
+               RETURNING last_generation''',
+            (now_ms,),
         ).fetchone()
-        old = row['last_generation'] if row else 0
+        if row is not None:
+            return row['last_generation']
 
-        # Новое значение: max(current time, old + 1)
-        new_gen = max(now_ms, old + 1)
-
-        # Записываем обратно (атомарно, т.к. мы внутри write-транзакции
-        # или conn.execute автоматически в WAL режиме)
+        # Первый запуск — вставляем строку
         conn.execute(
-            'UPDATE generation_counter SET last_generation=? WHERE rowid=1',
-            (new_gen,),
+            'INSERT OR IGNORE INTO generation_counter (rowid, last_generation) '
+            'VALUES (1, ?)',
+            (now_ms,),
         )
-        return new_gen
+        # Пытаемся обновить снова
+        row2 = conn.execute(
+            '''UPDATE generation_counter
+               SET last_generation = MAX(last_generation + 1, ?)
+               WHERE rowid=1
+               RETURNING last_generation''',
+            (now_ms,),
+        ).fetchone()
+        return row2['last_generation'] if row2 else now_ms
 
     # --- Stores ---
 
@@ -155,23 +168,49 @@ class Store:
     def reserve_generation_and_add_install(self, candidate: str,
                                             store_id: str,
                                             shop: str,
-                                            password: str) -> int:
+                                            password: str,
+                                            max_candidates: int = 5,
+                                            ttl: int = 86400 * 7) -> int:
         """Атомарно зарезервировать поколение и вставить кандидата.
 
         Выполняется в одной write-транзакции (BEGIN IMMEDIATE),
         что исключает race condition при конкурентных установках.
 
-        Перед вставкой удаляет все существующие pending-кандидаты
-        с тем же store_id+shop+password. Это исключает ситуацию,
-        когда при повторном install callback выживает старший
-        кандидат после uninstall (см. P2). Кандидаты с другими
-        credentials (другой пароль/другой магазин) не затрагиваются.
+        Перед вставкой:
+        1. Удаляет просроченных кандидатов (по shop, не store_id)
+        2. Удаляет лишних кандидатов сверх max_candidates (по shop)
+           — защита от SEC-1 и SEC-2.
+        3. Удаляет существующие pending с тем же store_id+shop+password.
 
         Returns:
             Зарезервированное значение generation.
         """
         with self._connect() as conn:
             conn.execute('BEGIN IMMEDIATE')
+
+            # 1. Очистка просроченных кандидатов по shop
+            threshold_ms = int(time.time() * 1000) - ttl * 1000
+            conn.execute(
+                'DELETE FROM installs WHERE shop=? AND generation<?',
+                (shop, threshold_ms),
+            )
+
+            # 2. Ограничение числа кандидатов по shop
+            excess = conn.execute(
+                'SELECT COUNT(*) - ? FROM installs WHERE shop=?',
+                (max_candidates - 1, shop),
+            ).fetchone()[0]
+            if excess > 0:
+                conn.execute(
+                    '''DELETE FROM installs WHERE shop=? AND candidate IN (
+                        SELECT candidate FROM installs WHERE shop=?
+                        ORDER BY generation DESC
+                        LIMIT -1 OFFSET ?
+                    )''',
+                    (shop, shop, max_candidates - 1),
+                )
+
+            # 3. Резервирование поколения
             now_ms = int(time.time() * 1000)
             last = conn.execute(
                 'SELECT COALESCE(MAX(generation), 0) FROM stores'
@@ -184,11 +223,14 @@ class Store:
             ).fetchone()[0]
             absolute_max = max(last, last_install, last_tombstone)
             generation = now_ms if now_ms > absolute_max else absolute_max + 1
-            # Удаляем существующие pending с matching credentials
+
+            # 4. Удаляем существующие pending с matching credentials
             conn.execute(
                 'DELETE FROM installs WHERE store_id=? AND shop=? AND password=?',
                 (store_id, shop, password),
             )
+
+            # 5. Вставка нового кандидата
             conn.execute(
                 '''INSERT OR REPLACE INTO installs
                    (candidate, store_id, shop, password, generation, created_at)
@@ -271,9 +313,12 @@ class Store:
             ).fetchone()
         return row['cnt'] if row else 0
 
-    def cleanup_stale_candidates(self, store_id: str, max_candidates: int = 5,
+    def cleanup_stale_candidates(self, shop: str, max_candidates: int = 5,
                                   ttl: int = 86400 * 7) -> int:
-        """Удалить лишних и просроченных кандидатов для магазина.
+        """Удалить лишних и просроченных кандидатов для магазина (по shop).
+
+        Очистка по домену магазина (shop), а не по store_id,
+        чтобы избежать вытеснения кандидатов поддельными ID (SEC-1/SEC-2).
 
         Удаляет кандидатов старше ttl секунд (по generation — миллисекунды).
         Если после чистки кандидатов больше max_candidates — оставляет
@@ -287,23 +332,23 @@ class Store:
             conn.execute('BEGIN IMMEDIATE')
             # Удалить просроченных
             cur = conn.execute(
-                'DELETE FROM installs WHERE store_id=? AND generation<?',
-                (store_id, threshold_ms),
+                'DELETE FROM installs WHERE shop=? AND generation<?',
+                (shop, threshold_ms),
             )
             deleted += cur.rowcount
             # Удалить лишних (оставить только max_candidates самых новых)
             excess = conn.execute(
-                'SELECT COUNT(*) - ? FROM installs WHERE store_id=?',
-                (max_candidates, store_id),
+                'SELECT COUNT(*) - ? FROM installs WHERE shop=?',
+                (max_candidates, shop),
             ).fetchone()[0]
             if excess > 0:
                 conn.execute(
-                    '''DELETE FROM installs WHERE store_id=? AND candidate IN (
-                        SELECT candidate FROM installs WHERE store_id=?
+                    '''DELETE FROM installs WHERE shop=? AND candidate IN (
+                        SELECT candidate FROM installs WHERE shop=?
                         ORDER BY generation DESC
                         LIMIT -1 OFFSET ?
                     )''',
-                    (store_id, store_id, max_candidates),
+                    (shop, shop, max_candidates),
                 )
                 deleted += excess
         return deleted
@@ -492,13 +537,15 @@ class Store:
     # --- Challenges ---
 
     def add_challenge(self, sid: str, store_id: str,
-                      nonce: str, ttl: int = 300) -> None:
+                      nonce: str, ttl: int = 300,
+                      generation: int = 0) -> None:
         expires = time.time() + ttl
         with self._connect() as conn:
             self._cleanup_expired(conn)
             conn.execute(
-                'INSERT INTO challenges VALUES (?, ?, ?, ?)',
-                (sid, store_id, nonce, expires),
+                'INSERT INTO challenges (sid, store_id, nonce, expires, generation) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (sid, store_id, nonce, expires, generation),
             )
 
     def consume_challenge(self, sid: str) -> StoreRow | None:

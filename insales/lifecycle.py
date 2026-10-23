@@ -75,15 +75,9 @@ class Lifecycle:
         password = store_password(token, self.app_secret)
         candidate = secrets.token_urlsafe(32)
 
-        # Проверка лимита кандидатов и срока жизни — очистка старых
-        # (до атомарной вставки, чтобы не блокировать транзакцию)
-        self.store.cleanup_stale_candidates(
-            store_id=insales_id,
-            max_candidates=MAX_CANDIDATES_PER_SHOP,
-            ttl=CANDIDATE_TTL,
-        )
-
-        # Атомарно: резервируем поколение и вставляем кандидата
+        # Атомарно: очистка старых кандидатов, резервирование поколения
+        # и вставка кандидата — в одной write-транзакции.
+        # Очистка по shop (домену), а не по store_id — защита от SEC-1/SEC-2.
         # (дедупликация существующих кандидатов с теми же credentials
         #  выполняется внутри reserve_generation_and_add_install)
         self.store.reserve_generation_and_add_install(
@@ -112,7 +106,7 @@ class Lifecycle:
 
         Returns:
             store_id при успешной активации, None если кандидатов нет.
-            В случае временной ошибки API кандидат сохраняется для повтора.
+            При временной ошибке API кандидат сохраняется для повтора.
 
         Raises:
             LifecycleError: при достоверно неверных credentials
@@ -128,23 +122,38 @@ class Lifecycle:
             account = client.get_account()[0]
         except ApiError as exc:
             if exc.is_temporary:
-                # Временная ошибка — кандидат сохраняется
+                # Временная ошибка — кандидат сохраняется.
+                # Проверяем активное подключение — если есть, даём войти.
+                active = self.store.get_store(store_id)
+                if active is not None and active['shop'] == shop:
+                    return active['id']
                 raise LifecycleError(
                     f'Temporary API error verifying install: {exc}'
                 ) from exc
-            # Достоверная ошибка (403, неверный формат) — удаляем кандидат
+            # Достоверная ошибка — удаляем кандидат
             self.store.delete_install(install['candidate'])
+            # Если есть активное подключение — продолжаем по нему
+            active = self.store.get_store(store_id)
+            if active is not None and active['shop'] == shop:
+                return active['id']
             raise LifecycleError(
                 f'API rejected credentials for install: {exc}'
             ) from exc
         except TransportError as exc:
-            # Ошибка соединения, таймаут — кандидат сохраняется
+            # Ошибка соединения, таймаут — кандидат сохраняется.
+            # Проверяем активное подключение
+            active = self.store.get_store(store_id)
+            if active is not None and active['shop'] == shop:
+                return active['id']
             raise LifecycleError(
                 f'Network error verifying install: {exc}'
             ) from exc
         except ResourceError as exc:
             # Битый JSON при 200 — удаляем кандидат (credentials неверны)
             self.store.delete_install(install['candidate'])
+            active = self.store.get_store(store_id)
+            if active is not None and active['shop'] == shop:
+                return active['id']
             raise LifecycleError(
                 f'Invalid API response for install: {exc}'
             ) from exc
@@ -203,7 +212,11 @@ class Lifecycle:
         challenge_sid = generate_session_id()
         nonce = generate_nonce()
 
-        self.store.add_challenge(challenge_sid, store_id, nonce, CHALLENGE_TTL)
+        self.store.add_challenge(
+            challenge_sid, store_id, nonce,
+            CHALLENGE_TTL,
+            generation=store_row['generation'],
+        )
         return challenge_sid, nonce, challenge_sid
 
     def verify_autologin(self, challenge_sid: str,
@@ -222,6 +235,11 @@ class Lifecycle:
 
         store_row = self.store.get_store(challenge['store_id'])
         if store_row is None:
+            return None
+
+        # Проверка поколения: challenge должен соответствовать
+        # текущему поколению магазина (защита от B2/backend-2)
+        if challenge.get('generation', 0) != store_row['generation']:
             return None
 
         expected = sign_token3(

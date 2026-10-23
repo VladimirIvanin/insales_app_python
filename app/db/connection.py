@@ -15,6 +15,7 @@ MIGRATIONS: list[tuple[int, str, str]] = [
     (4, 'Tombstones для отменённых установок', '0004_store_tombstones.sql'),
     (5, 'Удаление webhook-таблиц', '0005_remove_webhooks.sql'),
     (6, 'Счётчик поколений', '0006_generation_counter.sql'),
+    (7, 'Добавлен generation в challenges', '0007_challenges_generation.sql'),
 ]
 
 _SCHEMA_DIR = Path(__file__).parent / 'migrations'
@@ -47,6 +48,20 @@ def _migration_0002_sql(conn: sqlite3.Connection) -> str | None:
     except sqlite3.OperationalError:
         pass  # таблицы нет — будет создана миграцией 1
     return 'ALTER TABLE sessions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;'
+
+
+def _migration_0007_sql(conn: sqlite3.Connection) -> str | None:
+    """Проверить, нужно ли добавить generation в challenges.
+
+    Вызывается после миграции 6.
+    """
+    try:
+        cols = conn.execute('PRAGMA table_info(challenges)').fetchall()
+        if any(col[1] == 'generation' for col in cols):
+            return None  # колонка уже есть
+    except sqlite3.OperationalError:
+        pass
+    return 'ALTER TABLE challenges ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;'
 
 
 def _apply_migration(conn: sqlite3.Connection, version: int,
@@ -112,6 +127,8 @@ def upgrade(db_path: Path) -> None:
             # Подготовка SQL
             if version == 2:
                 sql = _migration_0002_sql(conn)
+            elif version == 7:
+                sql = _migration_0007_sql(conn)
             elif source.endswith('.sql'):
                 sql_path = _SCHEMA_DIR / source
                 if not sql_path.exists():

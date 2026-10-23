@@ -114,7 +114,8 @@ def cmd_doctor(settings: Settings) -> int:
             try:
                 stores = store.list_stores()
             except Exception as exc:
-                print(f'  – Невозможно прочитать список магазинов: {exc}')
+                print(f'  \u2717 Ошибка чтения списка магазинов: {exc}')
+                issues += 1
                 stores = []
             if not stores:
                 print('  – Нет установленных магазинов')

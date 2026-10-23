@@ -55,6 +55,8 @@ def create_app(settings: Settings | None = None) -> Flask:
     # --- Маскировка логов ---
     log = logging.getLogger('werkzeug')
     log.addFilter(MaskedRequestLogFilter())
+    gunicorn_log = logging.getLogger('gunicorn.access')
+    gunicorn_log.addFilter(MaskedRequestLogFilter())
 
     # templates — рядом с factory.py
     templates_dir = str(Path(__file__).parent / 'templates')
