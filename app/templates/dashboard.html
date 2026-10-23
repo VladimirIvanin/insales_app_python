@@ -67,7 +67,11 @@
       <span class="info-value">{{ store_id }}</span>
     </div>
     <div class="actions">
-      <a href="/probe" class="btn">Проверить API</a>
+      <a href="/probe?store_id={{ store_id | urlencode }}" class="btn">Проверить API</a>
+      <form action="/logout?store_id={{ store_id | urlencode }}" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn">Выйти</button>
+      </form>
     </div>
   </div>
   <div class="card">

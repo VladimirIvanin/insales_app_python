@@ -63,6 +63,9 @@ def create_app(settings: Settings | None = None) -> Flask:
     app = Flask(__name__, template_folder=templates_dir)
 
     app.secret_key = settings.flask_secret_key
+    app.config.update(SESSION_COOKIE_NAME='insales_python_csrf',
+                      SESSION_COOKIE_SECURE=settings.base_url.startswith('https://'),
+                      SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax')
 
     # --- Инициализация БД ---
     store = Store(settings.db_path)

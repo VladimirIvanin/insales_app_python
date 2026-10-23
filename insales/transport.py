@@ -83,9 +83,10 @@ class Transport:
             f'{app_id}:{password}'.encode()
         ).decode()
         self._dev = dev
+        self.timeout = REQUEST_TIMEOUT
 
     def _connect(self) -> http.client.HTTPConnection:
-        kwargs: dict[str, Any] = {'timeout': REQUEST_TIMEOUT}
+        kwargs: dict[str, Any] = {'timeout': self.timeout}
         if self.port:
             kwargs['port'] = self.port
         if self._dev and self.shop in _LOOPBACK_HOSTS:

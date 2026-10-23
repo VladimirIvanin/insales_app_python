@@ -18,7 +18,7 @@ from insales.crypto import (
     store_password,
 )
 from insales.errors import ApiError, ResourceError, TransportError
-from insales.store import Store
+from insales.store import PendingQuotaError, Store
 from insales.transport import validate_shop
 
 MAX_CANDIDATES_PER_SHOP = 5
@@ -58,7 +58,7 @@ class Lifecycle:
         3. Вычислить пароль магазина
         4. Сохранить кандидата с поколением установки
 
-        Не выполняет API-запросов. Не запускает фоновой проверки.
+        При заполнении очереди ограниченно проверяет старых кандидатов вне транзакции.
 
         Возвращает candidate_id (для логирования/отладки).
         """
@@ -75,15 +75,34 @@ class Lifecycle:
         password = store_password(token, self.app_secret)
         candidate = secrets.token_urlsafe(32)
 
-        # Атомарно: очистка старых кандидатов, резервирование поколения
-        # и вставка кандидата — в одной write-транзакции.
-        # Очистка по shop (домену), а не по store_id — защита от SEC-1/SEC-2.
-        # (дедупликация существующих кандидатов с теми же credentials
-        #  выполняется внутри reserve_generation_and_add_install)
-        self.store.reserve_generation_and_add_install(
-            candidate, insales_id, shop, password,
-        )
-        return candidate
+        active = self.store.get_store(insales_id)
+        if active and active['shop'] == shop and secure_compare(active['password'], password):
+            return None
+        try:
+            self.store.reserve_generation_and_add_install(
+                candidate, insales_id, shop, password
+            )
+        except PendingQuotaError:
+            deadline = time.monotonic() + 2
+            for pending in self.store.pending_installs(shop):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                status, _ = self._check_candidate(pending, remaining)
+                if status == 'invalid':
+                    self.store.delete_install(pending['candidate'])
+                    self.store.reserve_generation_and_add_install(
+                candidate, insales_id, shop, password
+            )
+                    break
+                if status == 'unavailable':
+                    break
+            else:
+                raise LifecycleError('Pending installation limit reached')
+            if self.store.get_install(candidate) is None:
+                raise LifecycleError('Pending installation limit reached') from None
+        return next((row['candidate'] for row in self.store.pending_installs(shop)
+                     if row['store_id'] == insales_id and row['password'] == password), candidate)
 
     def _make_client(self, shop: str, password: str) -> InSalesClient:
         """Создать клиент API для магазина. Выделено для тестов."""
@@ -116,58 +135,16 @@ class Lifecycle:
         if install is None:
             return None
 
-        client = self._make_client(install['shop'], install['password'])
-
-        try:
-            account = client.get_account()[0]
-        except ApiError as exc:
-            if exc.is_temporary:
-                # Временная ошибка — кандидат сохраняется.
-                # Проверяем активное подключение — если есть, даём войти.
-                active = self.store.get_store(store_id)
-                if active is not None and active['shop'] == shop:
-                    return active['id']
-                raise LifecycleError(
-                    f'Temporary API error verifying install: {exc}'
-                ) from exc
-            # Достоверная ошибка — удаляем кандидат
-            self.store.delete_install(install['candidate'])
-            # Если есть активное подключение — продолжаем по нему
+        status, account = self._check_candidate(install)
+        if status != 'valid':
+            if status == 'invalid':
+                self.store.delete_install(install['candidate'])
             active = self.store.get_store(store_id)
             if active is not None and active['shop'] == shop:
                 return active['id']
-            raise LifecycleError(
-                f'API rejected credentials for install: {exc}'
-            ) from exc
-        except TransportError as exc:
-            # Ошибка соединения, таймаут — кандидат сохраняется.
-            # Проверяем активное подключение
-            active = self.store.get_store(store_id)
-            if active is not None and active['shop'] == shop:
-                return active['id']
-            raise LifecycleError(
-                f'Network error verifying install: {exc}'
-            ) from exc
-        except ResourceError as exc:
-            # Битый JSON при 200 — удаляем кандидат (credentials неверны)
-            self.store.delete_install(install['candidate'])
-            active = self.store.get_store(store_id)
-            if active is not None and active['shop'] == shop:
-                return active['id']
-            raise LifecycleError(
-                f'Invalid API response for install: {exc}'
-            ) from exc
-
-        if not isinstance(account, dict):
-            self.store.delete_install(install['candidate'])
-            raise LifecycleError('Invalid API response format')
-
-        if str(account.get('id')) != str(install['store_id']):
-            self.store.delete_install(install['candidate'])
-            raise LifecycleError(
-                f'Store ID mismatch: expected {install["store_id"]}, '
-                f'got {account.get("id")}'
-            )
+            if status == 'invalid':
+                raise LifecycleError('API rejected credentials or Store ID mismatch')
+            raise LifecycleError('Temporary API error verifying install; retry later')
 
         ok = self.store.activate_install(
             install['candidate'], account.get('title', 'Store'),
@@ -177,6 +154,44 @@ class Lifecycle:
             return None
 
         return install['store_id']
+
+    def _check_candidate(self, install: dict, timeout: float = 5) -> tuple[str, dict | None]:
+        permit = self.store.claim_verification(install['shop'])
+        if permit is None:
+            return 'unavailable', None
+        delay = 0.0
+        try:
+            client = self._make_client(install['shop'], install['password'])
+            transport = getattr(client, '_transport', None)
+            if transport is not None:
+                transport.timeout = timeout
+            account = client.get_account()[0]
+            if not isinstance(account, dict) or 'id' not in account:
+                delay = 5
+                return 'unavailable', None
+            if str(account['id']) != str(install['store_id']):
+                return 'invalid', None
+            return 'valid', account
+        except ApiError as exc:
+            if exc.status in (401, 403):
+                return 'invalid', None
+            delay = 5
+            if exc.retry_after:
+                try:
+                    delay = max(delay, float(exc.retry_after))
+                except ValueError:
+                    from email.utils import parsedate_to_datetime
+                    try:
+                        retry_at = parsedate_to_datetime(exc.retry_after).timestamp()
+                        delay = max(delay, retry_at - time.time())
+                    except (ValueError, TypeError, OverflowError):
+                        pass
+            return 'unavailable', None
+        except (TransportError, ResourceError):
+            delay = 5
+            return 'unavailable', None
+        finally:
+            self.store.release_verification(install['shop'], permit, delay)
 
     # ---- Uninstall ----
 

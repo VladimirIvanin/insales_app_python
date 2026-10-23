@@ -14,6 +14,7 @@ Credentials в SQLite не зашифрованы.
 """
 from __future__ import annotations
 
+import secrets
 import sqlite3
 import time
 from collections.abc import Generator
@@ -28,6 +29,10 @@ SessionRow = dict
 
 class StoreError(Exception):
     """Ошибка хранилища (магазин не найден, дубликат и т.д.)."""
+
+
+class PendingQuotaError(StoreError):
+    """Очередь заполнена: освобождать можно только отклонённые credentials."""
 
 
 class Store:
@@ -77,7 +82,10 @@ class Store:
         """
         row = conn.execute(
             '''UPDATE generation_counter
-               SET last_generation = MAX(last_generation + 1, ?)
+               SET last_generation = MAX(last_generation + 1, ?,
+                   (SELECT COALESCE(MAX(generation), 0) + 1 FROM stores),
+                   (SELECT COALESCE(MAX(generation), 0) + 1 FROM installs),
+                   (SELECT COALESCE(MAX(generation), 0) + 1 FROM store_tombstones))
                WHERE rowid=1
                RETURNING last_generation''',
             (now_ms,),
@@ -94,7 +102,10 @@ class Store:
         # Пытаемся обновить снова
         row2 = conn.execute(
             '''UPDATE generation_counter
-               SET last_generation = MAX(last_generation + 1, ?)
+               SET last_generation = MAX(last_generation + 1, ?,
+                   (SELECT COALESCE(MAX(generation), 0) + 1 FROM stores),
+                   (SELECT COALESCE(MAX(generation), 0) + 1 FROM installs),
+                   (SELECT COALESCE(MAX(generation), 0) + 1 FROM store_tombstones))
                WHERE rowid=1
                RETURNING last_generation''',
             (now_ms,),
@@ -171,73 +182,69 @@ class Store:
                                             password: str,
                                             max_candidates: int = 5,
                                             ttl: int = 86400 * 7) -> int:
-        """Атомарно зарезервировать поколение и вставить кандидата.
-
-        Выполняется в одной write-транзакции (BEGIN IMMEDIATE),
-        что исключает race condition при конкурентных установках.
-
-        Перед вставкой:
-        1. Удаляет просроченных кандидатов (по shop, не store_id)
-        2. Удаляет лишних кандидатов сверх max_candidates (по shop)
-           — защита от SEC-1 и SEC-2.
-        3. Удаляет существующие pending с тем же store_id+shop+password.
-
-        Returns:
-            Зарезервированное значение generation.
-        """
+        """Сохранить кандидат без вытеснения уже принятых credentials."""
         with self._connect() as conn:
             conn.execute('BEGIN IMMEDIATE')
-
-            # 1. Очистка просроченных кандидатов по shop
-            threshold_ms = int(time.time() * 1000) - ttl * 1000
             conn.execute(
-                'DELETE FROM installs WHERE shop=? AND generation<?',
-                (shop, threshold_ms),
+                "DELETE FROM installs WHERE shop=? AND created_at < julianday('now') - ?",
+                (shop, ttl / 86400),
             )
-
-            # 2. Ограничение числа кандидатов по shop
-            excess = conn.execute(
-                'SELECT COUNT(*) - ? FROM installs WHERE shop=?',
-                (max_candidates - 1, shop),
-            ).fetchone()[0]
-            if excess > 0:
-                conn.execute(
-                    '''DELETE FROM installs WHERE shop=? AND candidate IN (
-                        SELECT candidate FROM installs WHERE shop=?
-                        ORDER BY generation DESC
-                        LIMIT -1 OFFSET ?
-                    )''',
-                    (shop, shop, max_candidates - 1),
-                )
-
-            # 3. Резервирование поколения
-            now_ms = int(time.time() * 1000)
-            last = conn.execute(
-                'SELECT COALESCE(MAX(generation), 0) FROM stores'
-            ).fetchone()[0]
-            last_install = conn.execute(
-                'SELECT COALESCE(MAX(generation), 0) FROM installs'
-            ).fetchone()[0]
-            last_tombstone = conn.execute(
-                'SELECT COALESCE(MAX(generation), 0) FROM store_tombstones'
-            ).fetchone()[0]
-            absolute_max = max(last, last_install, last_tombstone)
-            generation = now_ms if now_ms > absolute_max else absolute_max + 1
-
-            # 4. Удаляем существующие pending с matching credentials
-            conn.execute(
-                'DELETE FROM installs WHERE store_id=? AND shop=? AND password=?',
+            duplicate = conn.execute(
+                'SELECT generation FROM installs WHERE store_id=? AND shop=? AND password=?',
                 (store_id, shop, password),
-            )
-
-            # 5. Вставка нового кандидата
+            ).fetchone()
+            if duplicate:
+                return duplicate['generation']
+            count = conn.execute(
+                'SELECT COUNT(*) FROM installs WHERE shop=?', (shop,)
+            ).fetchone()[0]
+            if count >= max_candidates:
+                raise PendingQuotaError('Pending installation limit reached')
+            generation = self.next_generation(conn)
             conn.execute(
-                '''INSERT OR REPLACE INTO installs
-                   (candidate, store_id, shop, password, generation, created_at)
-                   VALUES (?, ?, ?, ?, ?, julianday("now"))''',
+                """INSERT INTO installs (candidate, store_id, shop, password, generation)
+                   VALUES (?, ?, ?, ?, ?)""",
                 (candidate, store_id, shop, password, generation),
             )
             return generation
+
+    def pending_installs(self, shop: str) -> list[dict]:
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                'SELECT * FROM installs WHERE shop=? ORDER BY generation', (shop,)
+            )]
+
+    def claim_verification(self, shop: str) -> str | None:
+        now = time.time()
+        token = secrets.token_hex(16)
+        with self._connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute(
+                'INSERT OR IGNORE INTO verification_budgets (shop, window_started) VALUES (?, ?)',
+                (shop, now),
+            )
+            row = conn.execute(
+                'SELECT * FROM verification_budgets WHERE shop=?', (shop,)
+            ).fetchone()
+            if row['next_attempt_at'] > now or row['lease_until'] > now:
+                return None
+            attempts = row['attempts'] if row['window_started'] > now - 60 else 0
+            if attempts >= 10:
+                return None
+            conn.execute(
+                """UPDATE verification_budgets SET window_started=?, attempts=?,
+                   lease_until=?, lease_token=? WHERE shop=?""",
+                (row['window_started'] if attempts else now, attempts + 1, now + 15, token, shop),
+            )
+        return token
+
+    def release_verification(self, shop: str, token: str, delay: float = 0) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE verification_budgets SET lease_until=0, lease_token=NULL,
+                   next_attempt_at=? WHERE shop=? AND lease_token=?""",
+                (time.time() + delay, shop, token),
+            )
 
     def get_install(self, candidate: str) -> StoreRow | None:
         with self._connect() as conn:
@@ -315,16 +322,10 @@ class Store:
 
     def cleanup_stale_candidates(self, shop: str, max_candidates: int = 5,
                                   ttl: int = 86400 * 7) -> int:
-        """Удалить лишних и просроченных кандидатов для магазина (по shop).
+        """Удалить только просроченных кандидатов указанного домена.
 
-        Очистка по домену магазина (shop), а не по store_id,
-        чтобы избежать вытеснения кандидатов поддельными ID (SEC-1/SEC-2).
-
-        Удаляет кандидатов старше ttl секунд (по generation — миллисекунды).
-        Если после чистки кандидатов больше max_candidates — оставляет
-        только самые новые.
-
-        Возвращает количество удалённых строк.
+        max_candidates сохранён для совместимости вызовов. Переполнение очереди
+        разрешается проверкой credentials при install, без удаления живых кандидатов.
         """
         threshold_ms = int(time.time() * 1000) - ttl * 1000
         deleted = 0
@@ -336,21 +337,6 @@ class Store:
                 (shop, threshold_ms),
             )
             deleted += cur.rowcount
-            # Удалить лишних (оставить только max_candidates самых новых)
-            excess = conn.execute(
-                'SELECT COUNT(*) - ? FROM installs WHERE shop=?',
-                (max_candidates, shop),
-            ).fetchone()[0]
-            if excess > 0:
-                conn.execute(
-                    '''DELETE FROM installs WHERE shop=? AND candidate IN (
-                        SELECT candidate FROM installs WHERE shop=?
-                        ORDER BY generation DESC
-                        LIMIT -1 OFFSET ?
-                    )''',
-                    (shop, shop, max_candidates),
-                )
-                deleted += excess
         return deleted
 
     def activate_install(self, candidate: str, title: str) -> bool:
@@ -400,6 +386,17 @@ class Store:
                 conn.execute('DELETE FROM installs WHERE candidate=?',
                              (candidate,))
                 return False
+
+            former = conn.execute(
+                'SELECT id, generation FROM stores WHERE shop=? AND id<>?',
+                (install['shop'], store_id),
+            ).fetchone()
+            if former and former['generation'] >= install_gen:
+                return False
+            if former:
+                conn.execute('DELETE FROM sessions WHERE store_id=?', (former['id'],))
+                conn.execute('DELETE FROM challenges WHERE store_id=?', (former['id'],))
+                conn.execute('DELETE FROM stores WHERE id=?', (former['id'],))
 
             # Удалить старые сессии/challenge
             conn.execute('DELETE FROM sessions WHERE store_id=?',
@@ -505,7 +502,11 @@ class Store:
             ).fetchone()
             if store_row is not None:
                 if store_row['shop'] != shop:
-                    return False
+                    cur = conn.execute(
+                        'DELETE FROM installs WHERE store_id=? AND shop=? AND password=?',
+                        (store_id, shop, password),
+                    )
+                    return cur.rowcount > 0
                 from insales.crypto import secure_compare
                 if secure_compare(password, store_row['password']):
                     # Active store найден с совпадающим паролем — удаляем всё.

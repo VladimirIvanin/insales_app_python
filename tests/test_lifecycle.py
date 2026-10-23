@@ -79,7 +79,7 @@ class TestInstall:
             )
 
     def test_repeat_install_same_credentials(self, lifecycle, store):
-        """Повторный install с теми же credentials заменяет кандидата."""
+        """Повторный install с теми же credentials сохраняет кандидата и поколение."""
         c1 = lifecycle.process_install(
             shop='shop.example', insales_id='42', token='install-token',
         )
@@ -88,8 +88,8 @@ class TestInstall:
         c2 = lifecycle.process_install(
             shop='shop.example', insales_id='42', token='install-token',
         )
-        # Первый кандидат должен быть заменён
-        assert store.get_install(c1) is None
+        assert c2 == c1
+        assert store.get_install(c1) is not None
         assert store.get_install(c2) is not None
 
     def test_install_duplicate_credentials_no_extra_candidates(
@@ -193,7 +193,7 @@ class TestVerifyInstall:
         mock_client = MagicMock()
         mock_client.get_account.side_effect = TransportError('Connection failed')
         with patch.object(lifecycle, '_make_client', return_value=mock_client):
-            with pytest.raises(LifecycleError, match='Network error'):
+            with pytest.raises(LifecycleError, match='Temporary API error'):
                 lifecycle.verify_pending_install('42', 'shop.example')
 
         assert store.count_installs_by_store('42') == 1

@@ -10,9 +10,11 @@ Endpoints:
 - GET  /probe           — API probe (требует сессии)
 """
 import json
+import re
+import secrets
 from urllib.parse import quote, urlencode
 
-from flask import Blueprint, g, make_response, redirect, render_template, request
+from flask import Blueprint, g, make_response, redirect, render_template, request, session
 
 from app.middleware import SessionMiddleware, require_session
 from insales.lifecycle import Lifecycle, LifecycleError
@@ -73,6 +75,8 @@ def create_routes(store: Store, lifecycle: Lifecycle,
             return 'Installation received', 200
         except (ValueError, KeyError):
             return 'Invalid request', 400
+        except LifecycleError:
+            return 'Installation verification unavailable; retry later', 503
 
     @blueprint.route('/login')
     def login():
@@ -83,7 +87,9 @@ def create_routes(store: Store, lifecycle: Lifecycle,
             insales_id = request.args.get('insales_id', '')
 
             store_row = store.get_store(insales_id)
-            if store_row is not None and store_row['shop'] != shop:
+            if not insales_id.isdigit():
+                return 'Invalid request', 400
+            if shop not in lifecycle.allowed_shops:
                 return 'Store not installed', 404
 
             # Шаг 1: проверяем более нового кандидата (даже если магазин активен)
@@ -103,10 +109,13 @@ def create_routes(store: Store, lifecycle: Lifecycle,
             except LifecycleError as e:
                 return str(e), 502
 
+            store_row = store.get_store(insales_id)
+            if store_row is None or store_row['shop'] != shop:
+                return 'Store not installed', 404
             challenge_sid, nonce, _ = lifecycle.create_challenge(insales_id)
             query = urlencode({
                 'token': nonce,
-                'login': base_url.rstrip('/') + '/autologin',
+                'login': base_url.rstrip('/') + '/autologin?' + urlencode({'flow': nonce}),
             })
             scheme = _login_scheme(base_url, lifecycle.dev, shop)
             login_url = (
@@ -122,6 +131,8 @@ def create_routes(store: Store, lifecycle: Lifecycle,
                 secure=secure,
                 max_age=300, path='/',
             )
+            response.set_cookie('login_' + nonce, challenge_sid, httponly=True,
+                                samesite='Lax', secure=secure, max_age=300, path='/')
             return response
         except (ValueError, KeyError):
             return 'Invalid request', 400
@@ -129,7 +140,11 @@ def create_routes(store: Store, lifecycle: Lifecycle,
     @blueprint.route('/autologin')
     def autologin():
         """Callback от InSales после подтверждения входа."""
-        challenge_sid = request.cookies.get('challenge_sid', '')
+        flow = request.args.get('flow', '')
+        if flow and not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', flow):
+            return 'Login failed', 401
+        cookie_name = 'login_' + flow if flow else 'challenge_sid'
+        challenge_sid = request.cookies.get(cookie_name, '')
         session_id = lifecycle.verify_autologin(
             challenge_sid=challenge_sid,
             params=request.args,
@@ -138,14 +153,15 @@ def create_routes(store: Store, lifecycle: Lifecycle,
             return 'Login failed', 401
 
         secure = _scheme(base_url) == 'https'
-        response = make_response(redirect('/', 302))
+        opened = store.get_session(session_id)
+        response = make_response(redirect('/?' + urlencode({'store_id': opened['store_id']}), 302))
         response.set_cookie(
             'app_session', session_id,
             httponly=True, samesite='Lax',
             secure=secure,
             max_age=3600, path='/',
         )
-        response.delete_cookie('challenge_sid', path='/')
+        response.delete_cookie(cookie_name, path='/')
         return response
 
     @blueprint.route('/uninstall')
@@ -175,7 +191,21 @@ def create_routes(store: Store, lifecycle: Lifecycle,
             title=store_row.get('title', 'Магазин'),
             shop=store_row['shop'],
             store_id=store_row['id'],
+            csrf_token=session.setdefault('csrf_token', secrets.token_urlsafe(32)),
         )
+
+    @blueprint.route('/logout', methods=['POST'])
+    @require_session(mw)
+    def logout():
+        expected = session.get('csrf_token', '')
+        provided = request.form.get('csrf_token', '')
+        if not expected or not secrets.compare_digest(expected, provided):
+            return 'Неверный запрос. Обновите страницу приложения.', 403
+        store.delete_session(g.session['sid'])
+        session.clear()
+        response = make_response('Вы вышли из приложения. Для входа откройте его из InSales.', 200)
+        response.delete_cookie('app_session', path='/')
+        return response
 
     @blueprint.route('/probe')
     @require_session(mw)
@@ -192,8 +222,9 @@ def create_routes(store: Store, lifecycle: Lifecycle,
             return render_template(
                 'probe.html',
                 result=json.dumps(result, indent=2, ensure_ascii=False),
+                store_id=g.store['id'],
             )
-        except Exception as e:
-            return f'API error: {e}', 502
+        except Exception:
+            return 'Не удалось получить ответ API магазина. Повторите проверку позже.', 502
 
     return blueprint

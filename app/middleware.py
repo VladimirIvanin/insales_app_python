@@ -71,17 +71,23 @@ def require_session(mw: SessionMiddleware):
         def wrapper(*args, **kwargs):
             session = mw.get_current_session()
             if session is None:
-                return '', 401
+                return 'Сессия недействительна. Откройте приложение из InSales.', 401
             # Получаем store в одном чтении и проверяем generation
             # на той же строке, из которой создаётся клиент.
             # Это устраняет race: если между чтениями произошла
             # переустановка, генерация не совпадёт.
             store = mw.store.get_store(session['store_id'])
             if store is None:
-                return '', 401
+                return 'Сессия недействительна. Откройте приложение из InSales.', 401
             if store['generation'] != session.get('generation', 0):
-                return '', 401
+                return 'Сессия недействительна. Откройте приложение из InSales.', 401
             g.session = session
+            expected_store = request.args.get('store_id')
+            if expected_store and expected_store != str(store['id']):
+                return (
+                    'Другая вкладка сменила магазин. Откройте приложение из нужного магазина.',
+                    409,
+                )
             g.store = store
             g.client = mw.get_client(store['shop'], store['password'])
             return f(*args, **kwargs)
