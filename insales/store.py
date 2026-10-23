@@ -64,8 +64,7 @@ class Store:
                 return self._ensure_monotonic(conn2, now_ms)
         return self._ensure_monotonic(conn, now_ms)
 
-    @staticmethod
-    def _ensure_monotonic(conn: sqlite3.Connection, now_ms: int) -> int:
+    def _ensure_monotonic(self, conn: sqlite3.Connection, now_ms: int) -> int:
         last = conn.execute(
             'SELECT COALESCE(MAX(generation), 0) FROM stores'
         ).fetchone()[0]
@@ -75,7 +74,15 @@ class Store:
         last_tombstone = conn.execute(
             'SELECT COALESCE(MAX(generation), 0) FROM store_tombstones'
         ).fetchone()[0]
-        return max(now_ms, last + 1, last_install + 1, last_tombstone + 1)
+        absolute_max = max(last, last_install, last_tombstone)
+        # Если now_ms больше любого существующего — используем его,
+        # иначе гарантируем рост: берём absolute_max + 1.
+        # Это обрабатывает случай, когда два вызова попадают
+        # в одну миллисекунду на пустой БД: первый вернёт now_ms,
+        # второй увидит что now_ms <= absolute_max и вернёт now_ms+1.
+        if now_ms > absolute_max:
+            return now_ms
+        return absolute_max + 1
 
     # --- Stores ---
 
@@ -171,7 +178,8 @@ class Store:
             last_tombstone = conn.execute(
                 'SELECT COALESCE(MAX(generation), 0) FROM store_tombstones'
             ).fetchone()[0]
-            generation = max(now_ms, last + 1, last_install + 1, last_tombstone + 1)
+            absolute_max = max(last, last_install, last_tombstone)
+            generation = now_ms if now_ms > absolute_max else absolute_max + 1
             # Удаляем существующие pending с matching credentials
             conn.execute(
                 'DELETE FROM installs WHERE store_id=? AND shop=? AND password=?',
