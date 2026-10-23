@@ -14,6 +14,7 @@ MIGRATIONS: list[tuple[int, str, str]] = [
     (3, 'Webhook-подписки и inbox', '0003_webhooks.sql'),
     (4, 'Tombstones для отменённых установок', '0004_store_tombstones.sql'),
     (5, 'Удаление webhook-таблиц', '0005_remove_webhooks.sql'),
+    (6, 'Счётчик поколений', '0006_generation_counter.sql'),
 ]
 
 _SCHEMA_DIR = Path(__file__).parent / 'migrations'

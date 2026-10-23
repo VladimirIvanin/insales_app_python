@@ -102,7 +102,7 @@ def test_upgrade_status(tmp_db):
     st2 = status(tmp_db)
     for entry in st2:
         if entry['version'] == 'current':
-            assert entry['applied'] == 5
+            assert entry['applied'] == 6
 
 
 def test_generation_monotonic_after_upgrade(tmp_db):
@@ -182,4 +182,4 @@ def test_next_generation_within_connection(tmp_db):
     with store._connect() as conn:  # noqa: SLF001
         gen1 = store.next_generation(conn)
         gen2 = store.next_generation(conn)
-        assert gen2 >= gen1
+        assert gen2 > gen1

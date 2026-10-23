@@ -55,27 +55,38 @@ class Store:
     def next_generation(self, conn: sqlite3.Connection | None = None) -> int:
         """Монотонно возрастающий номер поколения на основе времени.
 
+        Атомарно резервирует поколение через таблицу generation_counter,
+        гарантируя строгий рост даже при вызовах в пределах одной
+        миллисекунды (в отличие от старой read-only логики).
+
         Использует int(time.time() * 1000) как стартовую точку.
         Если часы переведены назад — гарантирует рост через MAX.
         """
         now_ms = int(time.time() * 1000)
         if conn is None:
             with self._connect() as conn2:
-                return self._ensure_monotonic(conn2, now_ms)
-        return self._ensure_monotonic(conn, now_ms)
+                return self._reserve_generation(conn2, now_ms)
+        return self._reserve_generation(conn, now_ms)
 
     @staticmethod
-    def _ensure_monotonic(conn: sqlite3.Connection, now_ms: int) -> int:
-        last = conn.execute(
-            'SELECT COALESCE(MAX(generation), 0) FROM stores'
-        ).fetchone()[0]
-        last_install = conn.execute(
-            'SELECT COALESCE(MAX(generation), 0) FROM installs'
-        ).fetchone()[0]
-        last_tombstone = conn.execute(
-            'SELECT COALESCE(MAX(generation), 0) FROM store_tombstones'
-        ).fetchone()[0]
-        return max(now_ms, last + 1, last_install + 1, last_tombstone + 1)
+    def _reserve_generation(conn: sqlite3.Connection, now_ms: int) -> int:
+        """Атомарно зарезервировать и сохранить следующее поколение."""
+        # Читаем старое значение
+        row = conn.execute(
+            'SELECT last_generation FROM generation_counter WHERE rowid=1'
+        ).fetchone()
+        old = row['last_generation'] if row else 0
+
+        # Новое значение: max(current time, old + 1)
+        new_gen = max(now_ms, old + 1)
+
+        # Записываем обратно (атомарно, т.к. мы внутри write-транзакции
+        # или conn.execute автоматически в WAL режиме)
+        conn.execute(
+            'UPDATE generation_counter SET last_generation=? WHERE rowid=1',
+            (new_gen,),
+        )
+        return new_gen
 
     # --- Stores ---
 
@@ -171,7 +182,8 @@ class Store:
             last_tombstone = conn.execute(
                 'SELECT COALESCE(MAX(generation), 0) FROM store_tombstones'
             ).fetchone()[0]
-            generation = max(now_ms, last + 1, last_install + 1, last_tombstone + 1)
+            absolute_max = max(last, last_install, last_tombstone)
+            generation = now_ms if now_ms > absolute_max else absolute_max + 1
             # Удаляем существующие pending с matching credentials
             conn.execute(
                 'DELETE FROM installs WHERE store_id=? AND shop=? AND password=?',
